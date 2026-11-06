@@ -44,15 +44,22 @@ The generated `fax_default_params.c/.h` expose `fax_default_candidate`. The gene
 
 ## 2. Build and run
 
-### Quick test with the included Linux x86-64 binary
+### Pre-built Windows Release
 
-The archive includes a convenience binary built in the current Linux x86-64 environment. It is dynamically linked to libpng, libjpeg-turbo and libtiff; rebuild it on another OS or architecture.
+The current pre-release provides a Windows installer supporting both x86 (32-bit) and x64 (64-bit) systems.
 
-```sh
-./build/gcc_c89/fax_engine_test examples/decoder_rgb.png /tmp/fax-demo adaptive
-```
+The installer automatically detects the operating system architecture and installs the corresponding application binaries.
 
-This writes `/tmp/fax-demo_best_g3.tif`, `_best.pgm` (a result preview only), `_best_params.json` and `_metrics.csv`. The PGM preview is never read back by the engine.
+- Windows x86 (32-bit)
+- Windows x64 (64-bit)
+
+**Pre-built binaries are currently available for Windows only.**
+
+The GUI application is currently Windows-specific.
+
+Linux and 16-bit DOS/Windows targets are not included in the current release. Source generation profiles are provided for these environments, but additional target-specific build and runtime validation is required.
+
+See [GitHub Releases](https://github.com/haninkj00-crypto/getfax/releases) for available downloads.
 
 ### GCC / Clang
 
