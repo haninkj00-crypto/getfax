@@ -2,7 +2,9 @@
 
 # Fax C Portable Engine — complete first implementation
 
-This project is a **development-time Python source generator** for a callable, embeddable C89 grayscale-to-1-bit fax engine. Python and NumPy are required only to generate the target C sources. The core engine does not start Python or require OpenCV/libtiff. The optional modern CLI image adapter uses codec APIs directly inside the same process.
+This project provides a portable C89 grayscale-to-1-bit fax processing engine, a Python-based source generator for multiple compiler targets, and a Windows GUI application written in Visual Basic 5 (VB5).
+
+The C engine is designed to be callable and embeddable in other applications. The Python generator is used only at development/build time. The Windows GUI provides an interactive interface for image selection, processing options, multi-page conversion, and progress monitoring. The GUI launches the C engine as a separate backend process.
 
 The implementation now contains the processing functions that were missing from the earlier baseline:
 
@@ -46,6 +48,48 @@ The generated `fax_default_params.c/.h` expose `fax_default_candidate`. The gene
 
 ## 2. Build and run
 
+
+### Windows GUI Application (Visual Basic 5)
+
+The project includes a native Windows GUI application written in **Visual Basic 5 (VB5)**. It provides an interactive front end for the C processing engine.
+
+The GUI and the C engine are separate executables. The GUI handles user interaction and launches the corresponding architecture-specific C backend as a separate process.
+
+#### Main features
+
+- **Image selection:** Browse and select input images in TIFF, PNG, JPEG, BMP, and PGM formats.
+- **TIFF page selection:** Detect the number of pages in multi-page TIFF files and select an individual page range or all pages.
+- **TIFF output:** Save processed images as Group 3 MH (1D) TIFF files. When multiple pages are selected, each page is saved as a separate TIFF file with a page-number suffix.
+- **Processing modes:**
+  - `Adaptive`: Automatically searches for suitable processing parameters using a coarse search followed by refinement.
+  - `Full`: Evaluates the complete 410-candidate parameter grid.
+  - `Apply`: Uses manually selected processing parameters without running the candidate search.
+- **Custom parameters:** Select Gamma correction, Local Dark enhancement, or CLAHE, and configure their respective parameters. Serpentine Floyd–Steinberg dithering can also be enabled or disabled.
+- **Progress monitoring:** Displays the current page, candidate evaluation progress, elapsed time, and estimated remaining time.
+- **Cancellation:** Allows the user to cancel an ongoing conversion and cleans up temporary backend files.
+
+#### GUI and backend architecture
+
+The GUI is implemented in Visual Basic 5 and runs as a 32-bit Windows process.
+
+Two GUI/backend configurations are provided:
+
+| Windows environment | GUI executable | C backend |
+|---|---|---|
+| 32-bit Windows | `getfax_x86.exe` | `faxeng32.exe` |
+| 64-bit Windows | `getfax_x64.exe` | `faxeng64.exe` |
+
+The x64 configuration still uses a 32-bit VB5 front end running under WOW64, paired with the native 64-bit C processing backend.
+
+The GUI starts the backend using the Windows process API, reads its progress information, and handles cancellation and output-file management. Image processing and TIFF encoding are performed by the C backend, not by the Visual Basic application.
+
+#### GUI source
+
+The Visual Basic project files and resources are available in the [`vb/`](vb/) directory.
+
+The GUI is currently Windows-only. No Linux or 16-bit GUI implementation is included.
+
+
 ### Pre-built Windows Release
 
 The current pre-release provides a Windows installer supporting both x86 (32-bit) and x64 (64-bit) systems.
@@ -66,12 +110,11 @@ See [GitHub Releases](https://github.com/haninkj00-crypto/getfax/releases) for a
 ### GCC / Clang
 
 ```sh
-cd build/gcc_c89
-gcc -std=c89 -pedantic -Wall -Wextra -Werror -O2 \
+gcc -std=c89 -pedantic -Wall -Wextra -Werror -O2 -pthread \
   -DFAX_WITH_PNG -DFAX_WITH_JPEG -DFAX_WITH_TIFF \
   $(pkg-config --cflags libpng libjpeg libtiff-4) \
   fax_core.c fax_engine.c fax_g3.c fax_image.c fax_tables.c \
-  fax_default_params.c fax_engine_test.c -lm \
+  fax_thread.c fax_default_params.c fax_engine_test.c -lm \
   $(pkg-config --libs libpng libjpeg libtiff-4) -o fax_engine_test
 ```
 
