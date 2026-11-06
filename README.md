@@ -1,4 +1,4 @@
-[**Windows용 설치/Install for Windows:**](https://github.com/haninkj00-crypto/getfax/releases)
+**Windows용 설치/Install for Windows:**[https://github.com/haninkj00-crypto/getfax/releases](https://github.com/haninkj00-crypto/getfax/releases)
 
 # Fax C Portable Engine — complete first implementation
 
