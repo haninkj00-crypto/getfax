@@ -1,0 +1,30 @@
+{
+  "name": "turbo_c_large_huge",
+  "description": "Turbo C large code/data model with huge-qualified image pointers for buffers crossing 64 KiB boundaries",
+  "compiler_id": "turbo_c",
+  "standard": "C89-era Borland C subset",
+  "memory_model": "large",
+  "image_qualifier": "huge",
+  "work_qualifier": "huge",
+  "table_qualifier": "far",
+  "inline_keyword": "",
+  "calling_convention": "",
+  "restrict_keyword": "",
+  "compile_command": "tcc -ml -c fax_core.c fax_engine.c fax_g3.c fax_tables.c fax_thread.c fax_default_params.c",
+  "version_command": "tcc",
+  "notes": [
+    "Public image pointers and image-sized workspace pointers are huge-qualified so row traversal can cross segment boundaries.",
+    "The library sources are compiled as objects; the convenience test driver is intentionally excluded because its malloc-based workspace allocator is not a DOS huge-memory allocator.",
+    "The host application must allocate every huge workspace array with a Turbo C-compatible huge allocator and assign the pointers explicitly.",
+    "The small dither row buffers are also huge-qualified for a uniform API; their individual size remains far below 64 KiB at fax widths.",
+    "This profile has not been compiled with Turbo C in the current environment; verify the exact compiler release and memory-model switches.",
+    "The full optimizer needs about 11 bytes per input pixel plus fixed workspace; conventional DOS memory is insufficient for a full fax page without EMS/XMS or a reduced working raster.",
+    "The optimizer and image transforms use C math functions (pow, exp, sqrt, floor, fmod); link the compiler math library/runtime.",
+    "The optional fax_image.c host adapter has built-in PGM/BMP readers only unless codec libraries are supplied. Modern PNG/JPEG/TIFF libraries are not part of the Turbo C core-only build.",
+    "The optimizer API consumes a caller-owned grayscale raster directly; a DOS host can supply its own file decoder or omit file I/O entirely."
+  ],
+  "cpu_architecture": "Intel 8086/8088-compatible target",
+  "compiler_version_target": "Turbo C 2.x/3.x family; confirm huge pointer support",
+  "endianness": "native compiler target; no byte-order assumptions in the core",
+  "threads": "none"
+}

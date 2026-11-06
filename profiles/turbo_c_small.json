@@ -1,0 +1,29 @@
+{
+  "name": "turbo_c_small",
+  "description": "Turbo C small memory model; intended for small images/buffers below one 64 KiB data segment",
+  "compiler_id": "turbo_c",
+  "standard": "C89-era Borland C subset",
+  "memory_model": "small",
+  "image_qualifier": "",
+  "work_qualifier": "",
+  "table_qualifier": "",
+  "inline_keyword": "",
+  "calling_convention": "",
+  "restrict_keyword": "",
+  "compile_command": "tcc -ms -c fax_core.c fax_engine.c fax_g3.c fax_tables.c fax_thread.c fax_default_params.c",
+  "version_command": "tcc",
+  "notes": [
+    "Small model uses near data pointers; all image and workspace arrays must fit within the available data segment.",
+    "The library sources are compiled as objects; the convenience test driver is intentionally excluded because the runtime workspace size is allocator/application specific.",
+    "For full-page fax rasters, use the large/huge-pointer profile and a suitable huge-memory allocator.",
+    "The engine performs no heap allocation; the host supplies all workspace arrays.",
+    "This profile has not been compiled with Turbo C in the current environment; verify the exact compiler release.",
+    "The optimizer and image transforms use C math functions (pow, exp, sqrt, floor, fmod); link the compiler math library/runtime.",
+    "The optional fax_image.c host adapter has built-in PGM/BMP readers only unless codec libraries are supplied. Modern PNG/JPEG/TIFF libraries are not part of the Turbo C core-only build.",
+    "The optimizer API consumes a caller-owned grayscale raster directly; a DOS host can supply its own file decoder or omit file I/O entirely."
+  ],
+  "cpu_architecture": "Intel 8086/8088-compatible target",
+  "compiler_version_target": "Turbo C 2.x/3.x family; confirm exact release",
+  "endianness": "native compiler target; no byte-order assumptions in the core",
+  "threads": "none"
+}

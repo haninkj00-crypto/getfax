@@ -1,0 +1,11 @@
+#include "fax_default_params.h"
+
+const fax_candidate fax_default_candidate = {
+    @FAMILY_ENUM@,
+    @PARAM_GAMMA@,
+    @PARAM_SERPENTINE@,
+    @PARAM_SIGMA@,
+    @PARAM_STRENGTH@,
+    @PARAM_FLOOR@,
+    @PARAM_CLIP@
+};

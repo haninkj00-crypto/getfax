@@ -1,0 +1,143 @@
+#include <stdio.h>
+#include "fax_core.h"
+
+#define TEST_WIDTH 17UL
+#define TEST_HEIGHT 9UL
+#define TEST_STRIDE 20UL
+
+int main(void)
+{
+    fax_u8 src_storage[TEST_STRIDE * TEST_HEIGHT];
+    fax_u8 dst_storage[TEST_STRIDE * TEST_HEIGHT];
+    fax_u8 stream_storage[TEST_STRIDE * TEST_HEIGHT];
+    fax_src_ptr src;
+    fax_dst_ptr dst;
+    fax_f32 row_a[TEST_WIDTH];
+    fax_f32 row_b[TEST_WIDTH];
+    fax_f32 stream_row_a[TEST_WIDTH];
+    fax_f32 stream_row_b[TEST_WIDTH];
+    fax_dither_state stream_state;
+    fax_src_ptr next_input_row;
+    fax_dst_ptr stream_output_row;
+    int has_next;
+    fax_index x;
+    fax_index y;
+    fax_index black_count;
+    fax_index checksum;
+    fax_status status;
+
+    src = (fax_src_ptr)src_storage;
+    dst = (fax_dst_ptr)dst_storage;
+
+    for (y = 0UL; y < TEST_HEIGHT; ++y) {
+        for (x = 0UL; x < TEST_STRIDE; ++x) {
+            if (x < TEST_WIDTH) {
+                src_storage[y * TEST_STRIDE + x] =
+                    (fax_u8)((x * 17UL + y * 31UL + x * y * 3UL) % 256UL);
+            } else {
+                src_storage[y * TEST_STRIDE + x] = (fax_u8)0;
+            }
+            dst_storage[y * TEST_STRIDE + x] = (fax_u8)127;
+            stream_storage[y * TEST_STRIDE + x] = (fax_u8)127;
+        }
+    }
+
+    status = fax_dither_lut(
+        src, TEST_WIDTH, TEST_HEIGHT, TEST_STRIDE,
+        dst, TEST_STRIDE, fax_gamma_lut, 1, row_a, row_b);
+
+    if (status != FAX_STATUS_OK) {
+        printf("FAIL: fax_dither_lut status=%d\n", (int)status);
+        return 1;
+    }
+
+    black_count = 0UL;
+    checksum = 0UL;
+    for (y = 0UL; y < TEST_HEIGHT; ++y) {
+        for (x = 0UL; x < TEST_WIDTH; ++x) {
+            fax_u8 value;
+            value = dst[y * TEST_STRIDE + x];
+            if (value == (fax_u8)0) {
+                ++black_count;
+            } else if (value != (fax_u8)255) {
+                printf("FAIL: non-binary output at %lu,%lu\n", y, x);
+                return 2;
+            }
+            checksum = (checksum * 33UL + (fax_index)value) % 65521UL;
+        }
+    }
+
+    if (black_count == 0UL || black_count == TEST_WIDTH * TEST_HEIGHT) {
+        printf("FAIL: degenerate black count=%lu\n", black_count);
+        return 3;
+    }
+
+    status = fax_dither_stream_init(
+        &stream_state, src, TEST_WIDTH, fax_gamma_lut, 1,
+        stream_row_a, stream_row_b);
+    if (status != FAX_STATUS_OK) {
+        printf("FAIL: stream init status=%d\n", (int)status);
+        return 8;
+    }
+    for (y = 0UL; y < TEST_HEIGHT; ++y) {
+        has_next = (y + 1UL < TEST_HEIGHT);
+        next_input_row = (fax_src_ptr)0;
+        if (has_next != 0) {
+            next_input_row = src + (y + 1UL) * TEST_STRIDE;
+        }
+        stream_output_row = (fax_dst_ptr)(stream_storage + y * TEST_STRIDE);
+        status = fax_dither_stream_process_row(
+            &stream_state, next_input_row, has_next, stream_output_row);
+        if (status != FAX_STATUS_OK) {
+            printf("FAIL: stream row %lu status=%d\n", y, (int)status);
+            return 9;
+        }
+    }
+    for (y = 0UL; y < TEST_HEIGHT; ++y) {
+        for (x = 0UL; x < TEST_WIDTH; ++x) {
+            if (stream_storage[y * TEST_STRIDE + x] != dst[y * TEST_STRIDE + x]) {
+                printf("FAIL: stream mismatch at %lu,%lu\n", y, x);
+                return 10;
+            }
+        }
+    }
+
+    /* Output padding is outside the image and must remain untouched. */
+    for (y = 0UL; y < TEST_HEIGHT; ++y) {
+        for (x = TEST_WIDTH; x < TEST_STRIDE; ++x) {
+            if (dst[y * TEST_STRIDE + x] != (fax_u8)127) {
+                printf("FAIL: output padding overwritten at %lu,%lu\n", y, x);
+                return 5;
+            }
+        }
+    }
+
+    /* Invalid stride must be rejected before touching the raster. */
+    status = fax_dither_lut(
+        src, TEST_WIDTH, TEST_HEIGHT, TEST_WIDTH - 1UL,
+        dst, TEST_STRIDE, fax_gamma_lut, 1, row_a, row_b);
+    if (status != FAX_STATUS_INVALID_STRIDE) {
+        printf("FAIL: invalid stride status=%d\n", (int)status);
+        return 4;
+    }
+
+    status = fax_dither_lut(
+        src, 0UL, TEST_HEIGHT, TEST_STRIDE,
+        dst, TEST_STRIDE, fax_gamma_lut, 1, row_a, row_b);
+    if (status != FAX_STATUS_INVALID_DIMENSIONS) {
+        printf("FAIL: zero width status=%d\n", (int)status);
+        return 6;
+    }
+
+    status = fax_dither_lut(
+        src, TEST_WIDTH, TEST_HEIGHT, TEST_STRIDE,
+        dst, TEST_STRIDE, fax_gamma_lut, 1, row_a, row_a);
+    if (status != FAX_STATUS_INVALID_ARGUMENT) {
+        printf("FAIL: aliased work rows status=%d\n", (int)status);
+        return 7;
+    }
+
+    printf("PASS black=%lu/%lu checksum=%lu\n",
+           black_count, TEST_WIDTH * TEST_HEIGHT, checksum);
+    return 0;
+}

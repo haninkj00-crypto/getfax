@@ -1,0 +1,15 @@
+Validated output on this build:
+PASS black=75/153 checksum=11310
+
+Builds tested:
+- GCC 14.2.0: -std=c89 -pedantic -Wall -Wextra -Werror -O2
+- Clang: -std=c89 -pedantic -Wall -Wextra -Werror -O2
+- GCC AddressSanitizer + UndefinedBehaviorSanitizer: passed
+
+Algorithm parity:
+- Python fs_dither_python vs generated C fax_dither_lut: 10/10 test cases pixel-exact.
+- C full-raster wrapper vs C row-streaming API: verified by test_fax.c.
+
+Not tested here:
+- Microsoft Visual C/C++ compiler.
+- Turbo C 2.x/3.x, small/large memory models, huge pointer behavior.

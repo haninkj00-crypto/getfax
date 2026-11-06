@@ -1,0 +1,281 @@
+#include "fax_engine.h"
+#include <string.h>
+#include <math.h>
+
+/* CCITT T.4 one-dimensional Modified Huffman codewords. */
+static const char *fax_white_term[64] = {
+ "00110101","000111","0111","1000","1011","1100","1110","1111",
+ "10011","10100","00111","01000","001000","000011","110100","110101",
+ "101010","101011","0100111","0001100","0001000","0010111","0000011","0000100",
+ "0101000","0101011","0010011","0100100","0011000","00000010","00000011","00011010",
+ "00011011","00010010","00010011","00010100","00010101","00010110","00010111","00101000",
+ "00101001","00101010","00101011","00101100","00101101","00000100","00000101","00001010",
+ "00001011","01010010","01010011","01010100","01010101","00100100","00100101","01011000",
+ "01011001","01011010","01011011","01001010","01001011","00110010","00110011","00110100"
+};
+static const char *fax_black_term[64] = {
+ "0000110111","010","11","10","011","0011","0010","00011",
+ "000101","000100","0000100","0000101","0000111","00000100","00000111","000011000",
+ "0000010111","0000011000","0000001000","00001100111","00001101000","00001101100","00000110111","00000101000",
+ "00000010111","00000011000","000011001010","000011001011","000011001100","000011001101","000001101000","000001101001",
+ "000001101010","000001101011","000011010010","000011010011","000011010100","000011010101","000011010110","000011010111",
+ "000001101100","000001101101","000011011010","000011011011","000001010100","000001010101","000001010110","000001010111",
+ "000001100100","000001100101","000001010010","000001010011","000000100100","000000110111","000000111000","000000100111",
+ "000000101000","000001011000","000001011001","000000101011","000000101100","000001011010","000001100110","000001100111"
+};
+static const char *fax_white_makeup[27] = {
+ "11011","10010","010111","0110111","00110110","00110111","01100100","01100101",
+ "01101000","01100111","011001100","011001101","011010010","011010011","011010100","011010101",
+ "011010110","011010111","011011000","011011001","011011010","011011011","010011000","010011001",
+ "010011010","011000","010011011"
+};
+static const char *fax_black_makeup[27] = {
+ "0000001111","000011001000","000011001001","000001011011","000000110011","000000110100",
+ "000000110101","0000001101100","0000001101101","0000001001010","0000001001011","0000001001100",
+ "0000001001101","0000001110010","0000001110011","0000001110100","0000001110101","0000001110110",
+ "0000001110111","0000001010010","0000001010011","0000001010100","0000001010101","0000001011010",
+ "0000001011011","0000001100100","0000001100101"
+};
+
+typedef struct fax_bit_writer {
+    fax_tiff_write_callback callback;
+    void *context;
+    fax_u8 byte_value;
+    int bit_count;
+    fax_u32 byte_count;
+    int failed;
+} fax_bit_writer;
+
+static int fax_emit_bytes(fax_tiff_write_callback callback, void *context,
+                          const fax_u8 *bytes, fax_index length)
+{
+    if (callback == (fax_tiff_write_callback)0) return 0;
+    return callback(context, bytes, length);
+}
+
+static void fax_bit_write(fax_bit_writer *writer, int bit)
+{
+    if (writer->failed) return;
+    if (bit != 0) writer->byte_value = (fax_u8)(writer->byte_value |
+                                      (fax_u8)(1U << (7 - writer->bit_count)));
+    ++writer->bit_count;
+    if (writer->bit_count == 8) {
+        if (fax_emit_bytes(writer->callback, writer->context,
+                           &writer->byte_value, 1UL) != 0) writer->failed = 1;
+        ++writer->byte_count;
+        writer->byte_value = 0;
+        writer->bit_count = 0;
+    }
+}
+
+static void fax_bit_write_code(fax_bit_writer *writer, const char *code)
+{
+    while (*code != '\0') {
+        fax_bit_write(writer, (*code == '1') ? 1 : 0);
+        ++code;
+    }
+}
+
+static void fax_bit_finish(fax_bit_writer *writer)
+{
+    if (writer->failed) return;
+    if (writer->bit_count != 0) {
+        if (fax_emit_bytes(writer->callback, writer->context,
+                           &writer->byte_value, 1UL) != 0) writer->failed = 1;
+        ++writer->byte_count;
+        writer->byte_value = 0;
+        writer->bit_count = 0;
+    }
+}
+
+static void fax_write_run(fax_bit_writer *writer, fax_index run, int white)
+{
+    fax_index makeup;
+    int index;
+    while (run >= 64UL) {
+        makeup = (run / 1728UL) * 1728UL;
+        if (makeup > 1728UL) makeup = 1728UL;
+        if (makeup == 0UL) {
+            makeup = (run / 64UL) * 64UL;
+            if (makeup > 1728UL) makeup = 1728UL;
+        }
+        index = (int)(makeup / 64UL) - 1;
+        if (index < 0) break;
+        if (index > 26) index = 26;
+        fax_bit_write_code(writer, white ? fax_white_makeup[index] : fax_black_makeup[index]);
+        run -= makeup;
+    }
+    fax_bit_write_code(writer, white ? fax_white_term[(int)run] : fax_black_term[(int)run]);
+}
+
+static fax_engine_status fax_encode_g3_row(
+    fax_src_ptr row, fax_index width,
+    fax_tiff_write_callback callback, void *context,
+    fax_u32 *encoded_size)
+{
+    fax_bit_writer writer;
+    fax_index x;
+    fax_index run;
+    int white;
+    int pixel_white;
+    static const char eol[] = "000000000001";
+    writer.callback = callback;
+    writer.context = context;
+    writer.byte_value = 0;
+    writer.bit_count = 0;
+    writer.byte_count = 0UL;
+    writer.failed = 0;
+    fax_bit_write_code(&writer, eol);
+    x = 0UL;
+    white = 1;
+    while (x < width) {
+        run = 0UL;
+        while (x + run < width) {
+            pixel_white = (row[x + run] != 0) ? 1 : 0;
+            if (pixel_white != white) break;
+            ++run;
+        }
+        fax_write_run(&writer, run, white);
+        x += run;
+        white = !white;
+    }
+    /* A zero-length final black run is not required; a run always advances. */
+    fax_bit_finish(&writer);
+    if (writer.failed) return FAX_ENGINE_WRITE_ERROR;
+    *encoded_size = writer.byte_count;
+    return FAX_ENGINE_OK;
+}
+
+static int fax_write_u16(fax_tiff_write_callback writer, void *context, fax_u16 value)
+{
+    fax_u8 bytes[2];
+    bytes[0] = (fax_u8)(value & 255U);
+    bytes[1] = (fax_u8)((value >> 8) & 255U);
+    return fax_emit_bytes(writer, context, bytes, 2UL);
+}
+
+static int fax_write_u32(fax_tiff_write_callback writer, void *context, fax_u32 value)
+{
+    fax_u8 bytes[4];
+    bytes[0] = (fax_u8)(value & 255UL);
+    bytes[1] = (fax_u8)((value >> 8) & 255UL);
+    bytes[2] = (fax_u8)((value >> 16) & 255UL);
+    bytes[3] = (fax_u8)((value >> 24) & 255UL);
+    return fax_emit_bytes(writer, context, bytes, 4UL);
+}
+
+static int fax_write_ifd_entry(fax_tiff_write_callback writer, void *context,
+                               fax_u16 tag, fax_u16 type, fax_u32 count,
+                               fax_u32 value)
+{
+    if (fax_write_u16(writer, context, tag) != 0) return 1;
+    if (fax_write_u16(writer, context, type) != 0) return 1;
+    if (fax_write_u32(writer, context, count) != 0) return 1;
+    return fax_write_u32(writer, context, value);
+}
+
+fax_engine_status FAX_CALL fax_write_g3_tiff(
+    fax_src_ptr binary, fax_index width, fax_index height, fax_index stride,
+    double dpi_x, double dpi_y,
+    fax_engine_workspace *workspace,
+    fax_tiff_write_callback writer, void *writer_context)
+{
+    fax_index y;
+    fax_index data_offset;
+    fax_index cursor;
+    fax_index ifd_end;
+    fax_index offsets_position;
+    fax_index counts_position;
+    fax_index xres_position;
+    fax_index yres_position;
+    fax_index pixels_position;
+    fax_u32 row_size;
+    fax_u32 x_num;
+    fax_u32 y_num;
+    fax_u32 denominator;
+    fax_u32 value32;
+    fax_engine_status status;
+    if (binary == (fax_src_ptr)0 || writer == (fax_tiff_write_callback)0 ||
+        workspace == (fax_engine_workspace *)0 || width == 0UL || height == 0UL ||
+        stride < width || dpi_x <= 0.0 || dpi_y <= 0.0 ||
+        workspace->capacity_height < height ||
+        workspace->strip_offsets == (fax_u32 FAX_WORK_QUAL *)0 ||
+        workspace->strip_byte_counts == (fax_u32 FAX_WORK_QUAL *)0) return FAX_ENGINE_INVALID_ARGUMENT;
+    for (y = 0UL; y < height; ++y) {
+        status = fax_encode_g3_row(binary + y * stride, width,
+                                  (fax_tiff_write_callback)0, (void *)0,
+                                  &workspace->strip_byte_counts[y]);
+        if (status != FAX_ENGINE_OK) return status;
+    }
+    ifd_end = 8UL + 2UL + 14UL * 12UL + 4UL;
+    offsets_position = ifd_end;
+    if (height == 1UL) {
+        counts_position = 0UL;
+        xres_position = ifd_end;
+    } else {
+        counts_position = offsets_position + height * 4UL;
+        xres_position = counts_position + height * 4UL;
+    }
+    yres_position = xres_position + 8UL;
+    pixels_position = yres_position + 8UL;
+    if (pixels_position > 0xffffffffUL) return FAX_ENGINE_NUMERIC_RANGE;
+    cursor = pixels_position;
+    for (y = 0UL; y < height; ++y) {
+        workspace->strip_offsets[y] = (fax_u32)cursor;
+        if (workspace->strip_byte_counts[y] > 0xffffffffUL - cursor) {
+            return FAX_ENGINE_NUMERIC_RANGE;
+        }
+        cursor += workspace->strip_byte_counts[y];
+    }
+    data_offset = pixels_position;
+    denominator = 1000UL;
+    x_num = (fax_u32)(dpi_x * 1000.0 + 0.5);
+    y_num = (fax_u32)(dpi_y * 1000.0 + 0.5);
+    if (x_num == 0UL || y_num == 0UL) return FAX_ENGINE_NUMERIC_RANGE;
+
+    /* TIFF header and sorted Image File Directory. */
+    {
+        static const fax_u8 header[8] = {0x49,0x49,0x2a,0x00,0x08,0x00,0x00,0x00};
+        if (fax_emit_bytes(writer, writer_context, header, 8UL) != 0) return FAX_ENGINE_WRITE_ERROR;
+    }
+    if (fax_write_u16(writer, writer_context, 14U) != 0) return FAX_ENGINE_WRITE_ERROR;
+    if (fax_write_ifd_entry(writer, writer_context, 256U, 4U, 1UL, (fax_u32)width) != 0) return FAX_ENGINE_WRITE_ERROR;
+    if (fax_write_ifd_entry(writer, writer_context, 257U, 4U, 1UL, (fax_u32)height) != 0) return FAX_ENGINE_WRITE_ERROR;
+    if (fax_write_ifd_entry(writer, writer_context, 258U, 3U, 1UL, 1UL) != 0) return FAX_ENGINE_WRITE_ERROR;
+    if (fax_write_ifd_entry(writer, writer_context, 259U, 3U, 1UL, 3UL) != 0) return FAX_ENGINE_WRITE_ERROR;
+    if (fax_write_ifd_entry(writer, writer_context, 262U, 3U, 1UL, 0UL) != 0) return FAX_ENGINE_WRITE_ERROR;
+    value32 = (height == 1UL) ? workspace->strip_offsets[0] : (fax_u32)offsets_position;
+    if (fax_write_ifd_entry(writer, writer_context, 273U, 4U, (fax_u32)height, value32) != 0) return FAX_ENGINE_WRITE_ERROR;
+    if (fax_write_ifd_entry(writer, writer_context, 277U, 3U, 1UL, 1UL) != 0) return FAX_ENGINE_WRITE_ERROR;
+    if (fax_write_ifd_entry(writer, writer_context, 278U, 4U, 1UL, 1UL) != 0) return FAX_ENGINE_WRITE_ERROR;
+    value32 = (height == 1UL) ? workspace->strip_byte_counts[0] : (fax_u32)counts_position;
+    if (fax_write_ifd_entry(writer, writer_context, 279U, 4U, (fax_u32)height, value32) != 0) return FAX_ENGINE_WRITE_ERROR;
+    if (fax_write_ifd_entry(writer, writer_context, 282U, 5U, 1UL, (fax_u32)xres_position) != 0) return FAX_ENGINE_WRITE_ERROR;
+    if (fax_write_ifd_entry(writer, writer_context, 283U, 5U, 1UL, (fax_u32)yres_position) != 0) return FAX_ENGINE_WRITE_ERROR;
+    if (fax_write_ifd_entry(writer, writer_context, 284U, 3U, 1UL, 1UL) != 0) return FAX_ENGINE_WRITE_ERROR;
+    if (fax_write_ifd_entry(writer, writer_context, 292U, 4U, 1UL, 0UL) != 0) return FAX_ENGINE_WRITE_ERROR;
+    if (fax_write_ifd_entry(writer, writer_context, 296U, 3U, 1UL, 2UL) != 0) return FAX_ENGINE_WRITE_ERROR;
+    if (fax_write_u32(writer, writer_context, 0UL) != 0) return FAX_ENGINE_WRITE_ERROR;
+
+    if (height > 1UL) {
+        for (y = 0UL; y < height; ++y) {
+            if (fax_write_u32(writer, writer_context, workspace->strip_offsets[y]) != 0) return FAX_ENGINE_WRITE_ERROR;
+        }
+        for (y = 0UL; y < height; ++y) {
+            if (fax_write_u32(writer, writer_context, workspace->strip_byte_counts[y]) != 0) return FAX_ENGINE_WRITE_ERROR;
+        }
+    }
+    if (fax_write_u32(writer, writer_context, x_num) != 0 ||
+        fax_write_u32(writer, writer_context, denominator) != 0 ||
+        fax_write_u32(writer, writer_context, y_num) != 0 ||
+        fax_write_u32(writer, writer_context, denominator) != 0) return FAX_ENGINE_WRITE_ERROR;
+    for (y = 0UL; y < height; ++y) {
+        status = fax_encode_g3_row(binary + y * stride, width,
+                                   writer, writer_context, &row_size);
+        if (status != FAX_ENGINE_OK) return status;
+        if (row_size != workspace->strip_byte_counts[y]) return FAX_ENGINE_WRITE_ERROR;
+    }
+    (void)data_offset;
+    (void)cursor;
+    return FAX_ENGINE_OK;
+}

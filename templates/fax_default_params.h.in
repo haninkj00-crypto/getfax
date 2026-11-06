@@ -1,0 +1,16 @@
+#ifndef FAX_DEFAULT_PARAMS_H
+#define FAX_DEFAULT_PARAMS_H
+
+#include "fax_engine.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+extern const fax_candidate fax_default_candidate;
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* FAX_DEFAULT_PARAMS_H */

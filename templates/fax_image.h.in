@@ -1,0 +1,49 @@
+#ifndef FAX_IMAGE_H
+#define FAX_IMAGE_H
+
+#include "fax_core.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum fax_image_format {
+    FAX_IMAGE_UNKNOWN = 0,
+    FAX_IMAGE_PGM = 1,
+    FAX_IMAGE_BMP = 2,
+    FAX_IMAGE_PNG = 3,
+    FAX_IMAGE_JPEG = 4,
+    FAX_IMAGE_TIFF = 5
+} fax_image_format;
+
+typedef struct fax_image {
+    fax_u8 *pixels;              /* owned, contiguous 8-bit grayscale */
+    fax_index width;
+    fax_index height;
+    fax_index stride;            /* bytes per row; currently equals width */
+    double dpi_x;                /* 0 when metadata is unavailable */
+    double dpi_y;
+    int format;
+    unsigned long selected_page; /* zero-based TIFF directory */
+} fax_image;
+
+/*
+ * Decode a file directly into one caller-visible grayscale allocation.
+ * No intermediate PGM/BMP file or child process is used. PNG/JPEG/TIFF
+ * support is enabled at build time with FAX_WITH_PNG/JPEG/TIFF and the
+ * corresponding codec libraries linked into the same executable.
+ * PGM (P2/P5) and uncompressed Windows BMP (1/4/8/24/32 bpp) are built in.
+ * TIFF page_index is zero-based; for non-TIFF images it must be zero.
+ */
+int FAX_CALL fax_image_load_file(
+    const char *path, unsigned long page_index, fax_image *image,
+    char *error_text, fax_index error_capacity);
+
+void FAX_CALL fax_image_release(fax_image *image);
+const char *FAX_CALL fax_image_format_name(int format);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* FAX_IMAGE_H */

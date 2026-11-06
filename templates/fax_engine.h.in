@@ -1,0 +1,205 @@
+#ifndef FAX_ENGINE_H
+#define FAX_ENGINE_H
+
+#include "fax_core.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define FAX_CANDIDATE_CAPACITY 512UL
+#define FAX_CLAHE_TILES_X 12
+#define FAX_CLAHE_TILES_Y 8
+#define FAX_CLAHE_MAP_BYTES (FAX_CLAHE_TILES_X * FAX_CLAHE_TILES_Y * 256)
+#define FAX_GAUSSIAN_MAX_RADIUS 256
+
+typedef enum fax_family {
+    FAX_FAMILY_GAMMA = 0,
+    FAX_FAMILY_LOCAL_DARK = 1,
+    FAX_FAMILY_CLAHE = 2
+} fax_family;
+
+typedef enum fax_grid_mode {
+    FAX_GRID_ADAPTIVE = 0,
+    FAX_GRID_FULL = 1
+} fax_grid_mode;
+
+typedef enum fax_engine_status {
+    FAX_ENGINE_OK = 0,
+    FAX_ENGINE_INVALID_ARGUMENT = 20,
+    FAX_ENGINE_INVALID_DIMENSIONS = 21,
+    FAX_ENGINE_INSUFFICIENT_WORKSPACE = 22,
+    FAX_ENGINE_NUMERIC_RANGE = 23,
+    FAX_ENGINE_TOO_MANY_CANDIDATES = 24,
+    FAX_ENGINE_WRITE_ERROR = 25
+} fax_engine_status;
+
+typedef struct fax_candidate {
+    int family;
+    double gamma;
+    int serpentine;
+    double sigma_px;
+    double strength;
+    double floor_value;
+    double clip;
+} fax_candidate;
+
+typedef struct fax_metrics {
+    double score;
+    double mae;
+    double ncc;
+    double dark_corr;
+    double detail_ratio;
+    double black_pct;
+    double target_black_pct;
+    double tone_bias;
+    double fidelity_score;
+    double detail_score;
+    double coverage_score;
+    double transitions_per_row;
+} fax_metrics;
+
+typedef struct fax_candidate_result {
+    fax_index candidate_id;
+    fax_candidate params;
+    fax_metrics metrics;
+} fax_candidate_result;
+
+typedef struct fax_search_entry {
+    fax_index candidate_id;
+    fax_candidate params;
+    int evaluated;
+} fax_search_entry;
+
+typedef struct fax_search_info {
+    fax_index candidates_evaluated;
+    fax_index candidates_planned;
+    unsigned int refine_rounds_used;
+    int converged;
+} fax_search_info;
+
+typedef struct fax_engine_workspace {
+    fax_u8 FAX_WORK_QUAL *detail_ref;
+    fax_work_ptr work_tmp;
+    fax_work_ptr reconstruction;
+    fax_u8 FAX_WORK_QUAL *base_image;
+    fax_u8 FAX_WORK_QUAL *binary_image;
+    fax_work_ptr dither_row_a;
+    fax_work_ptr dither_row_b;
+    fax_u8 FAX_WORK_QUAL *clahe_maps;
+    fax_work_ptr gaussian_kernel;
+    fax_search_entry FAX_WORK_QUAL *candidate_entries;
+    fax_u32 FAX_WORK_QUAL *strip_offsets;
+    fax_u32 FAX_WORK_QUAL *strip_byte_counts;
+    fax_index capacity_pixels;
+    fax_index capacity_width;
+    fax_index capacity_height;
+    fax_index candidate_capacity;
+} fax_engine_workspace;
+
+/*
+ * Optional progress notification, called after every evaluated candidate.
+ * estimated_total is the planned count plus a guess for refinement rounds that
+ * may still be added (adaptive mode); it equals planned in full-grid mode.
+ */
+typedef void (FAX_CALL *fax_progress_callback)(
+    fax_index evaluated, fax_index planned, fax_index estimated_total,
+    void *context);
+
+typedef struct fax_optimizer_options {
+    int grid_mode;
+    double sigma_px;
+    double recon_sigma;
+    unsigned int refine_rounds;
+    fax_progress_callback progress;   /* may be NULL */
+    void *progress_context;
+    /*
+     * Optional extra workspaces for parallel candidate evaluation.  Each one
+     * needs every buffer of the main workspace except detail_ref (shared,
+     * read-only), candidate_entries and the TIFF strip arrays.  With
+     * extra_count == 0 (or a build without threads) evaluation is serial.
+     * Results are identical for any thread count.  The candidate and progress
+     * callbacks are invoked under a lock, possibly from worker threads.
+     */
+    fax_engine_workspace *extra_workspaces;
+    unsigned int extra_count;
+} fax_optimizer_options;
+
+typedef void (FAX_CALL *fax_candidate_callback)(
+    const fax_candidate_result *result, void *context);
+typedef int (FAX_CALL *fax_tiff_write_callback)(
+    void *context, const fax_u8 *bytes, fax_index length);
+
+/*
+ * The workspace is caller-owned. Every pointer must reference writable memory.
+ * Byte raster arrays require width*height bytes; float arrays require
+ * width*height elements; row arrays require width elements;
+ * clahe_maps requires FAX_CLAHE_MAP_BYTES bytes; gaussian_kernel requires
+ * FAX_GAUSSIAN_MAX_RADIUS+1 fax_f32 elements; candidate_entries requires
+ * candidate_capacity entries; TIFF strip arrays require height fax_u32 values.
+ */
+ fax_engine_status FAX_CALL fax_engine_validate_workspace(
+    fax_index width, fax_index height,
+    const fax_engine_workspace *workspace);
+
+fax_engine_status FAX_CALL fax_gaussian_blur_u8_f32(
+    fax_src_ptr source, fax_work_ptr destination, fax_work_ptr temporary,
+    fax_index width, fax_index height, fax_index source_stride,
+    fax_index destination_stride, double sigma, int border_replicate,
+    fax_work_ptr kernel, fax_index kernel_capacity);
+
+fax_engine_status FAX_CALL fax_gaussian_blur_f32(
+    fax_const_work_ptr source, fax_work_ptr destination, fax_work_ptr temporary,
+    fax_index width, fax_index height, fax_index source_stride,
+    fax_index destination_stride, double sigma, int border_replicate,
+    fax_work_ptr kernel, fax_index kernel_capacity);
+
+fax_engine_status FAX_CALL fax_local_dark_enhance(
+    fax_src_ptr gray, fax_index width, fax_index height, fax_index stride,
+    double sigma, double strength, double floor_value, double gamma,
+    fax_dst_ptr destination, fax_index destination_stride,
+    fax_engine_workspace *workspace);
+
+fax_engine_status FAX_CALL fax_clahe_enhance(
+    fax_src_ptr gray, fax_index width, fax_index height, fax_index stride,
+    double clip_limit, double gamma,
+    fax_dst_ptr destination, fax_index destination_stride,
+    fax_engine_workspace *workspace);
+
+fax_engine_status FAX_CALL fax_render_candidate(
+    fax_src_ptr gray, fax_index width, fax_index height, fax_index stride,
+    const fax_candidate *candidate, fax_engine_workspace *workspace,
+    fax_dst_ptr binary, fax_index binary_stride);
+
+fax_engine_status FAX_CALL fax_score_binary(
+    fax_src_ptr gray, fax_index width, fax_index height, fax_index stride,
+    double detail_sigma, fax_src_ptr binary, fax_index binary_stride,
+    double recon_sigma, fax_engine_workspace *workspace,
+    fax_metrics *metrics);
+
+fax_engine_status FAX_CALL fax_optimize(
+    fax_src_ptr gray, fax_index width, fax_index height, fax_index stride,
+    const fax_optimizer_options *options,
+    fax_engine_workspace *workspace,
+    fax_candidate_result *best_result,
+    fax_dst_ptr best_binary, fax_index best_binary_stride,
+    fax_candidate_callback callback, void *callback_context,
+    fax_search_info *search_info);
+
+fax_engine_status FAX_CALL fax_apply_candidate(
+    fax_src_ptr gray, fax_index width, fax_index height, fax_index stride,
+    const fax_candidate *candidate, fax_engine_workspace *workspace,
+    fax_dst_ptr binary, fax_index binary_stride);
+
+/* Writes a little-endian, 1-bit, CCITT Group 3 (MH/1D) TIFF via callback. */
+fax_engine_status FAX_CALL fax_write_g3_tiff(
+    fax_src_ptr binary, fax_index width, fax_index height, fax_index stride,
+    double dpi_x, double dpi_y,
+    fax_engine_workspace *workspace,
+    fax_tiff_write_callback writer, void *writer_context);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* FAX_ENGINE_H */

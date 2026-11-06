@@ -1,0 +1,29 @@
+{
+  "name": "gcc_c89",
+  "description": "GCC on modern Unix-like systems, strict ANSI C89 baseline",
+  "compiler_id": "gcc",
+  "standard": "C89",
+  "memory_model": "flat",
+  "image_qualifier": "",
+  "work_qualifier": "",
+  "table_qualifier": "",
+  "inline_keyword": "",
+  "calling_convention": "",
+  "restrict_keyword": "",
+  "compile_command": "gcc -std=c89 -pedantic -Wall -Wextra -Werror -O2 -pthread -DFAX_WITH_PNG -DFAX_WITH_JPEG -DFAX_WITH_TIFF $(pkg-config --cflags libpng libjpeg libtiff-4) fax_core.c fax_engine.c fax_g3.c fax_image.c fax_tables.c fax_thread.c fax_default_params.c fax_engine_test.c -lm $(pkg-config --libs libpng libjpeg libtiff-4) -o fax_engine_test",
+  "version_command": "gcc --version",
+  "notes": [
+    "Strict C89 build; no C99 headers or syntax are required.",
+    "The caller supplies image buffers and two row work buffers.",
+    "The engine performs no heap allocation; the host supplies its workspace. The convenience test driver uses malloc and standard file I/O.",
+    "The optimizer and image transforms use C math functions (pow, exp, sqrt, floor, fmod); ensure the toolchain links its math runtime.",
+    "The CLI decodes PGM/BMP internally and uses libpng/libjpeg/libtiff APIs in-process for PNG/JPEG/TIFF. No image converter subprocess or intermediate PGM is created.",
+    "The decoder libraries are linked into the same process. Use static codec archives and static-link flags if a self-contained executable is required; shared-library linking does not start separate converter processes.",
+    "TIFF accepts a zero-based directory/page argument. TIFF planar-separate images are rejected explicitly; all eight TIFF orientations are normalized. CMYK/YCCK JPEG is rejected explicitly.",
+    "For a build without PNG/JPEG/TIFF dependencies, omit FAX_WITH_* defines and codec libraries; built-in PGM and BMP remain available."
+  ],
+  "cpu_architecture": "host compiler target; select x86/x64/ARM through GCC target options",
+  "compiler_version_target": "GCC 4.x+ recommended; strict C89 subset",
+  "endianness": "native compiler target; no byte-order assumptions in the core",
+  "threads": "pthread"
+}

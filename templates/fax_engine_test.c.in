@@ -1,0 +1,460 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "fax_engine.h"
+#include "fax_image.h"
+#include "fax_default_params.h"
+#include "fax_thread.h"
+
+static int write_pgm(const char *path, const fax_u8 *pixels,
+                     fax_index width, fax_index height)
+{
+    FILE *file;
+    size_t count;
+    file = fopen(path, "wb");
+    if (file == (FILE *)0) return 0;
+    fprintf(file, "P5\n%lu %lu\n255\n", width, height);
+    count = (size_t)(width * height);
+    if (fwrite(pixels, 1, count, file) != count) { fclose(file); return 0; }
+    fclose(file);
+    return 1;
+}
+
+static int tiff_writer(void *context, const fax_u8 *bytes, fax_index length)
+{
+    FILE *file;
+    file = (FILE *)context;
+    return (fwrite(bytes, 1, (size_t)length, file) == (size_t)length) ? 0 : 1;
+}
+
+static void csv_callback(const fax_candidate_result *result, void *context)
+{
+    FILE *file;
+    file = (FILE *)context;
+    fprintf(file,
+        "%lu,%d,%.6f,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+        result->candidate_id, result->params.family, result->params.gamma,
+        result->params.serpentine, result->params.sigma_px,
+        result->params.strength, result->params.floor_value, result->params.clip,
+        result->metrics.score, result->metrics.mae, result->metrics.ncc,
+        result->metrics.dark_corr, result->metrics.detail_ratio,
+        result->metrics.black_pct, result->metrics.target_black_pct,
+        result->metrics.tone_bias, result->metrics.fidelity_score,
+        result->metrics.detail_score, result->metrics.coverage_score,
+        result->metrics.transitions_per_row);
+}
+
+static int allocate_workspace(fax_engine_workspace *ws,
+                              fax_index width, fax_index height)
+{
+    fax_index n;
+    n = width * height;
+    memset(ws, 0, sizeof(*ws));
+    ws->detail_ref = (fax_u8 *)malloc((size_t)n);
+    ws->work_tmp = (fax_f32 *)malloc((size_t)n * sizeof(fax_f32));
+    ws->reconstruction = (fax_f32 *)malloc((size_t)n * sizeof(fax_f32));
+    ws->base_image = (fax_u8 *)malloc((size_t)n);
+    ws->binary_image = (fax_u8 *)malloc((size_t)n);
+    ws->dither_row_a = (fax_f32 *)malloc((size_t)width * sizeof(fax_f32));
+    ws->dither_row_b = (fax_f32 *)malloc((size_t)width * sizeof(fax_f32));
+    ws->clahe_maps = (fax_u8 *)malloc(FAX_CLAHE_MAP_BYTES);
+    ws->gaussian_kernel = (fax_f32 *)malloc((FAX_GAUSSIAN_MAX_RADIUS + 1UL) * sizeof(fax_f32));
+    ws->candidate_capacity = FAX_CANDIDATE_CAPACITY;
+    ws->candidate_entries = (fax_search_entry *)malloc(
+        (size_t)ws->candidate_capacity * sizeof(fax_search_entry));
+    ws->strip_offsets = (fax_u32 *)malloc((size_t)height * sizeof(fax_u32));
+    ws->strip_byte_counts = (fax_u32 *)malloc((size_t)height * sizeof(fax_u32));
+    ws->capacity_pixels = n;
+    ws->capacity_width = width;
+    ws->capacity_height = height;
+    return ws->detail_ref != (fax_u8 *)0 && ws->work_tmp != (fax_f32 *)0 &&
+        ws->reconstruction != (fax_f32 *)0 && ws->base_image != (fax_u8 *)0 &&
+        ws->binary_image != (fax_u8 *)0 && ws->dither_row_a != (fax_f32 *)0 &&
+        ws->dither_row_b != (fax_f32 *)0 && ws->clahe_maps != (fax_u8 *)0 &&
+        ws->gaussian_kernel != (fax_f32 *)0 &&
+        ws->candidate_entries != (fax_search_entry *)0 &&
+        ws->strip_offsets != (fax_u32 *)0 && ws->strip_byte_counts != (fax_u32 *)0;
+}
+
+static int write_best_params(const char *path, const fax_candidate_result *best)
+{
+    FILE *file;
+    const char *family;
+    family = (best->params.family == FAX_FAMILY_GAMMA) ? "gamma" :
+        ((best->params.family == FAX_FAMILY_LOCAL_DARK) ? "local_dark" : "clahe");
+    file = fopen(path, "wb");
+    if (file == (FILE *)0) return 0;
+    fprintf(file, "{\n  \"family\": \"%s\",\n", family);
+    fprintf(file, "  \"gamma\": %.12g,\n", best->params.gamma);
+    fprintf(file, "  \"serpentine\": %s", best->params.serpentine ? "true" : "false");
+    if (best->params.family == FAX_FAMILY_LOCAL_DARK) {
+        fprintf(file, ",\n  \"sigma_px\": %.12g,\n  \"strength\": %.12g,\n  \"floor\": %.12g",
+            best->params.sigma_px, best->params.strength, best->params.floor_value);
+    } else if (best->params.family == FAX_FAMILY_CLAHE) {
+        fprintf(file, ",\n  \"clip\": %.12g", best->params.clip);
+    }
+    fprintf(file, "\n}\n");
+    fclose(file);
+    return 1;
+}
+
+static void free_workspace(fax_engine_workspace *ws)
+{
+    free(ws->detail_ref); free(ws->work_tmp); free(ws->reconstruction);
+    free(ws->base_image); free(ws->binary_image);
+    free(ws->dither_row_a); free(ws->dither_row_b);
+    free(ws->clahe_maps); free(ws->gaussian_kernel); free(ws->candidate_entries);
+    free(ws->strip_offsets); free(ws->strip_byte_counts);
+    memset(ws, 0, sizeof(*ws));
+}
+
+/* ---- command-line options (apply mode) and progress reporting ---------- */
+
+typedef struct run_options {
+    int has_family;   int family;
+    int has_gamma;    double gamma;
+    int has_serp;     int serpentine;
+    int has_sigma;    double sigma;
+    int has_strength; double strength;
+    int has_floor;    double floor_value;
+    int has_clip;     double clip;
+    int has_threads;  unsigned int threads;   /* 0 = automatic */
+    const char *progress_path;
+} run_options;
+
+static FILE *g_progress = (FILE *)0;
+
+static void progress_write(unsigned long evaluated, unsigned long planned,
+                           unsigned long estimated)
+{
+    if (g_progress == (FILE *)0) return;
+    /* fixed-width record rewritten in place so a polling reader never sees
+       a truncated file: "EEEEEEEEEE PPPPPPPPPP TTTTTTTTTT\r\n" */
+    fseek(g_progress, 0L, SEEK_SET);
+    fprintf(g_progress, "%10lu %10lu %10lu\r\n", evaluated, planned, estimated);
+    fflush(g_progress);
+}
+
+static void FAX_CALL progress_callback(fax_index evaluated, fax_index planned,
+                                       fax_index estimated, void *context)
+{
+    (void)context;
+    progress_write((unsigned long)evaluated, (unsigned long)planned,
+                   (unsigned long)estimated);
+}
+
+static int parse_number(const char *text, double *out)
+{
+    char *end;
+    double value;
+    if (text == (const char *)0 || *text == '\0') return 0;
+    value = strtod(text, &end);
+    if (*end != '\0') return 0;
+    *out = value;
+    return 1;
+}
+
+static int parse_options(int argc, char **argv, int first, run_options *o)
+{
+    int i;
+    const char *key;
+    const char *val;
+    double number;
+    memset(o, 0, sizeof(*o));
+    for (i = first; i < argc; ++i) {
+        key = argv[i];
+        if (strncmp(key, "--", 2) != 0 || i + 1 >= argc) {
+            fprintf(stderr, "bad option: %s\n", key);
+            return 0;
+        }
+        val = argv[++i];
+        if (strcmp(key, "--family") == 0) {
+            if (strcmp(val, "gamma") == 0) o->family = FAX_FAMILY_GAMMA;
+            else if (strcmp(val, "local_dark") == 0) o->family = FAX_FAMILY_LOCAL_DARK;
+            else if (strcmp(val, "clahe") == 0) o->family = FAX_FAMILY_CLAHE;
+            else { fprintf(stderr, "unknown family: %s\n", val); return 0; }
+            o->has_family = 1;
+        } else if (strcmp(key, "--progress") == 0) {
+            o->progress_path = val;
+        } else if (strcmp(key, "--threads") == 0) {
+            if (!parse_number(val, &number) || number < 0.0 || number > 64.0) {
+                fprintf(stderr, "--threads must be 0 (auto) .. 64\n"); return 0;
+            }
+            o->threads = (unsigned int)number; o->has_threads = 1;
+        } else if (strcmp(key, "--serpentine") == 0) {
+            if (strcmp(val, "0") != 0 && strcmp(val, "1") != 0) {
+                fprintf(stderr, "--serpentine must be 0 or 1\n"); return 0;
+            }
+            o->serpentine = (val[0] == '1'); o->has_serp = 1;
+        } else if (parse_number(val, &number)) {
+            if (strcmp(key, "--gamma") == 0) { o->gamma = number; o->has_gamma = 1; }
+            else if (strcmp(key, "--sigma") == 0) { o->sigma = number; o->has_sigma = 1; }
+            else if (strcmp(key, "--strength") == 0) { o->strength = number; o->has_strength = 1; }
+            else if (strcmp(key, "--floor") == 0) { o->floor_value = number; o->has_floor = 1; }
+            else if (strcmp(key, "--clip") == 0) { o->clip = number; o->has_clip = 1; }
+            else { fprintf(stderr, "unknown option: %s\n", key); return 0; }
+        } else {
+            fprintf(stderr, "bad value for %s: %s\n", key, val);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Start from the generated default candidate and override what was given. */
+static int build_apply_candidate(const run_options *o, fax_candidate *c)
+{
+    *c = fax_default_candidate;
+    if (o->has_family && o->family != c->family) {
+        c->family = o->family;
+        c->sigma_px = 0.0; c->strength = 0.0; c->floor_value = 0.0; c->clip = 0.0;
+    }
+    if (c->family == FAX_FAMILY_LOCAL_DARK) {
+        if (c->sigma_px <= 0.0) c->sigma_px = 7.0;
+        if (c->strength <= 0.0) c->strength = 0.425;
+    } else if (c->family == FAX_FAMILY_CLAHE) {
+        if (c->clip <= 0.0) c->clip = 0.75;
+    }
+    if (o->has_gamma) c->gamma = o->gamma;
+    if (o->has_serp) c->serpentine = o->serpentine;
+    if (c->family == FAX_FAMILY_LOCAL_DARK) {
+        if (o->has_sigma) c->sigma_px = o->sigma;
+        if (o->has_strength) c->strength = o->strength;
+        if (o->has_floor) c->floor_value = o->floor_value;
+    } else if (c->family == FAX_FAMILY_CLAHE) {
+        if (o->has_clip) c->clip = o->clip;
+    }
+    if (c->gamma < 0.1 || c->gamma > 5.0) {
+        fprintf(stderr, "gamma must be 0.1..5.0\n"); return 0;
+    }
+    if (c->family == FAX_FAMILY_LOCAL_DARK) {
+        if (c->sigma_px < 0.5 || c->sigma_px > 85.0) {
+            fprintf(stderr, "sigma must be 0.5..85\n"); return 0;
+        }
+        if (c->strength < 0.0 || c->strength > 2.0) {
+            fprintf(stderr, "strength must be 0..2\n"); return 0;
+        }
+        if (c->floor_value < 0.0 || c->floor_value > 1.0) {
+            fprintf(stderr, "floor must be 0..1\n"); return 0;
+        }
+    } else if (c->family == FAX_FAMILY_CLAHE) {
+        if (c->clip < 0.1 || c->clip > 10.0) {
+            fprintf(stderr, "clip must be 0.1..10\n"); return 0;
+        }
+    }
+    return 1;
+}
+
+
+/* Chooses the thread count: explicit value, or CPU count capped at 8, then
+   limited by the platform cap and the workspace memory budget. */
+static unsigned int choose_threads(const run_options *o, fax_index width,
+                                   fax_index height)
+{
+    unsigned long per_thread_mb;
+    unsigned long by_memory;
+    unsigned int n;
+    per_thread_mb = (unsigned long)((width * height / 1048576UL) * 11UL) + 2UL;
+    by_memory = (unsigned long)FAX_THREAD_MEMORY_MB / per_thread_mb;
+    if (by_memory < 1UL) by_memory = 1UL;
+    if (o->has_threads && o->threads > 0U) {
+        n = o->threads;
+    } else {
+        n = (unsigned int)fax_thread_cpu_count();
+        if (n > 8U) n = 8U;
+    }
+    if (n > (unsigned int)FAX_MAX_THREADS) n = (unsigned int)FAX_MAX_THREADS;
+    if ((unsigned long)n > by_memory) n = (unsigned int)by_memory;
+    if (n < 1U) n = 1U;
+    return n;
+}
+
+static void free_extras(fax_engine_workspace *extras, unsigned int count)
+{
+    unsigned int i;
+    for (i = 0U; i < count; ++i) free_workspace(&extras[i]);
+}
+
+int main(int argc, char **argv)
+{
+    fax_u8 *gray;
+    fax_image input_image;
+    char input_error[256];
+    unsigned long page_index;
+    fax_u8 *best_binary;
+    fax_index width;
+    fax_index height;
+    fax_engine_workspace workspace;
+    fax_optimizer_options options;
+    fax_candidate_result best;
+    fax_candidate apply_candidate;
+    fax_search_info info;
+    fax_engine_status status;
+    run_options run;
+    fax_engine_workspace extras[FAX_MAX_THREADS];
+    unsigned int extra_count;
+    unsigned int thread_total;
+    FILE *csv;
+    FILE *tiff;
+    char path[512];
+    char *page_end;
+    int full_grid;
+    int apply_mode;
+    int first_option;
+    const char *mode;
+    if (argc < 3) {
+        fprintf(stderr,
+            "usage: fax_engine_test input-image output_prefix [adaptive|full|apply]\n"
+            "       [zero-based-tiff-page] [options]\n"
+            "options (apply mode only):\n"
+            "  --family gamma|local_dark|clahe   --gamma 0.1..5   --serpentine 0|1\n"
+            "  --sigma S --strength K --floor F  (local_dark)   --clip C (clahe)\n"
+            "  --progress file   (all modes) progress record rewritten in place\n"
+            "  --threads N       worker threads for adaptive/full search (0 = automatic)\n");
+        return 2;
+    }
+    mode = (argc > 3) ? argv[3] : "adaptive";
+    full_grid = (strcmp(mode, "full") == 0);
+    apply_mode = (strcmp(mode, "apply") == 0);
+    if (!full_grid && !apply_mode && strcmp(mode, "adaptive") != 0) {
+        fprintf(stderr, "unknown mode: %s\n", mode);
+        return 2;
+    }
+    page_index = 0UL;
+    first_option = 4;
+    if (argc > 4 && strncmp(argv[4], "--", 2) != 0) {
+        page_index = strtoul(argv[4], &page_end, 10);
+        if (*page_end != '\0') {
+            fprintf(stderr, "bad page index: %s\n", argv[4]);
+            return 2;
+        }
+        first_option = 5;
+    }
+    if (!parse_options(argc, argv, first_option, &run)) return 2;
+    if (!apply_mode && (run.has_family || run.has_gamma || run.has_serp ||
+        run.has_sigma || run.has_strength || run.has_floor || run.has_clip)) {
+        fprintf(stderr, "note: candidate options are used only in apply mode\n");
+    }
+    if (apply_mode && !build_apply_candidate(&run, &apply_candidate)) return 2;
+    if (run.progress_path != (const char *)0) {
+        g_progress = fopen(run.progress_path, "wb");
+        if (g_progress == (FILE *)0) {
+            fprintf(stderr, "cannot create progress file\n");
+            return 2;
+        }
+        progress_write(0UL, 0UL, 0UL);
+    }
+    memset(&input_image, 0, sizeof(input_image));
+    if (!fax_image_load_file(argv[1], page_index, &input_image,
+                             input_error, (fax_index)sizeof(input_error))) {
+        fprintf(stderr, "input decode failed: %s\n", input_error);
+        return 3;
+    }
+    gray = input_image.pixels;
+    width = input_image.width;
+    height = input_image.height;
+    printf("Input: format=%s size=%lux%lu dpi=%.3fx%.3f page=%lu\n",
+        fax_image_format_name(input_image.format), width, height,
+        input_image.dpi_x, input_image.dpi_y, input_image.selected_page);
+    memset(&workspace, 0, sizeof(workspace));
+    best_binary = (fax_u8 *)malloc((size_t)(width * height));
+    if (best_binary == (fax_u8 *)0 || !allocate_workspace(&workspace, width, height)) {
+        fprintf(stderr, "out of memory\n");
+        fax_image_release(&input_image); free(best_binary); free_workspace(&workspace);
+        return 4;
+    }
+    options.grid_mode = full_grid ? FAX_GRID_FULL : FAX_GRID_ADAPTIVE;
+    {
+        const fax_candidate *ref;
+        ref = apply_mode ? &apply_candidate : &fax_default_candidate;
+        options.sigma_px = (ref->family == FAX_FAMILY_LOCAL_DARK &&
+                            ref->sigma_px > 0.0) ? ref->sigma_px : 7.0;
+    }
+    options.recon_sigma = 0.75;
+    options.refine_rounds = 3U;
+    extra_count = 0U;
+    thread_total = 1U;
+    if (!apply_mode) {
+        thread_total = choose_threads(&run, width, height);
+        while (extra_count + 1U < thread_total) {
+            if (!allocate_workspace(&extras[extra_count], width, height)) {
+                free_workspace(&extras[extra_count]);
+                break;
+            }
+            /* detail_ref is shared with the main workspace; not needed here */
+            free(extras[extra_count].detail_ref);
+            extras[extra_count].detail_ref = (fax_u8 *)0;
+            ++extra_count;
+        }
+        thread_total = extra_count + 1U;
+        printf("Threads: %u\n", thread_total);
+    }
+    options.extra_workspaces = (extra_count > 0U) ? extras : (fax_engine_workspace *)0;
+    options.extra_count = extra_count;
+    options.progress = progress_callback;
+    options.progress_context = (void *)0;
+    strcpy(path, argv[2]); strcat(path, "_metrics.csv");
+    csv = fopen(path, "wb");
+    if (csv == (FILE *)0) { fprintf(stderr, "cannot create metrics CSV\n"); return 5; }
+    fprintf(csv, "candidate_id,family,gamma,serpentine,sigma_px,strength,floor,clip,score,mae,ncc,dark_corr,detail_ratio,black_pct,target_black_pct,tone_bias,fidelity_score,detail_score,coverage_score,transitions_per_row\n");
+    if (apply_mode) {
+        best.candidate_id = 0UL;
+        best.params = apply_candidate;
+        progress_write(0UL, 1UL, 1UL);
+        status = fax_apply_candidate(gray, width, height, width,
+            &best.params, &workspace, best_binary, width);
+        if (status == FAX_ENGINE_OK) {
+            status = fax_score_binary(gray, width, height, width,
+                options.sigma_px, best_binary, width, options.recon_sigma,
+                &workspace, &best.metrics);
+        }
+        info.candidates_evaluated = 1UL;
+        info.candidates_planned = 1UL;
+        info.refine_rounds_used = 0U;
+        info.converged = 1;
+        if (status == FAX_ENGINE_OK) {
+            csv_callback(&best, csv);
+            progress_write(1UL, 1UL, 1UL);
+        }
+    } else {
+        status = fax_optimize(gray, width, height, width, &options, &workspace,
+            &best, best_binary, width, csv_callback, csv, &info);
+    }
+    fclose(csv);
+    free_extras(extras, extra_count);
+    if (status != FAX_ENGINE_OK) {
+        fprintf(stderr, "optimizer failed: %d\n", (int)status);
+        fax_image_release(&input_image); free(best_binary); free_workspace(&workspace); return 6;
+    }
+    strcpy(path, argv[2]); strcat(path, "_best_params.json");
+    if (!write_best_params(path, &best)) {
+        fprintf(stderr, "cannot write best params JSON\n"); return 10;
+    }
+    strcpy(path, argv[2]); strcat(path, "_best.pgm");
+    if (!write_pgm(path, best_binary, width, height)) {
+        fprintf(stderr, "cannot write best PGM\n"); return 7;
+    }
+    strcpy(path, argv[2]); strcat(path, "_best_g3.tif");
+    tiff = fopen(path, "wb");
+    if (tiff == (FILE *)0) { fprintf(stderr, "cannot create TIFF\n"); return 8; }
+    status = fax_write_g3_tiff(best_binary, width, height, width,
+        (input_image.dpi_x > 0.0) ? input_image.dpi_x : 204.0,
+        (input_image.dpi_y > 0.0) ? input_image.dpi_y : 196.0,
+        &workspace, tiff_writer, tiff);
+    fclose(tiff);
+    if (status != FAX_ENGINE_OK) {
+        fprintf(stderr, "G3 TIFF encoder failed: %d\n", (int)status);
+        fax_image_release(&input_image); free(best_binary); free_workspace(&workspace); return 9;
+    }
+    printf("PASS mode=%s candidates=%lu rounds=%u converged=%d best_id=%lu score=%.6f family=%d gamma=%.4f serpentine=%d\n",
+        mode, info.candidates_evaluated, info.refine_rounds_used, info.converged,
+        best.candidate_id, best.metrics.score, best.params.family,
+        best.params.gamma, best.params.serpentine);
+    printf("best sigma=%.4f strength=%.4f floor=%.4f clip=%.4f black=%.3f%%\n",
+        best.params.sigma_px, best.params.strength,
+        best.params.floor_value, best.params.clip, best.metrics.black_pct);
+    fax_image_release(&input_image);
+    free(best_binary);
+    free_workspace(&workspace);
+    return 0;
+}

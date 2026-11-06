@@ -1,0 +1,74 @@
+#ifndef FAX_CORE_H
+#define FAX_CORE_H
+
+#include "fax_port.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum fax_status {
+    FAX_STATUS_OK = 0,
+    FAX_STATUS_INVALID_ARGUMENT = 1,
+    FAX_STATUS_INVALID_DIMENSIONS = 2,
+    FAX_STATUS_INVALID_STRIDE = 3
+} fax_status;
+
+typedef struct fax_dither_state {
+    fax_index width;
+    fax_index row_index;
+    fax_work_ptr current_row;
+    fax_work_ptr next_row;
+    fax_table_ptr lut;
+    int serpentine;
+} fax_dither_state;
+
+/*
+ * Initialize the streaming dither state with the first grayscale input row.
+ * row_a and row_b must each contain at least width fax_f32 elements.
+ */
+ fax_status FAX_CALL fax_dither_stream_init(
+    fax_dither_state *state,
+    fax_src_ptr first_input_row,
+    fax_index width,
+    fax_table_ptr lut,
+    int serpentine,
+    fax_work_ptr row_a,
+    fax_work_ptr row_b);
+
+/*
+ * Process the current row held in state and write one binary output row.
+ * next_input_row must point to the following grayscale row when has_next
+ * is nonzero; otherwise it may be NULL. The caller controls row sequencing.
+ */
+ fax_status FAX_CALL fax_dither_stream_process_row(
+    fax_dither_state *state,
+    fax_src_ptr next_input_row,
+    int has_next,
+    fax_dst_ptr output_row);
+
+/*
+ * Convenience wrapper for a complete strided raster. Input and output are
+ * 8-bit grayscale-style rasters; output pixels are exactly 0 or 255.
+ * The caller owns all buffers. No allocation or image-sized temporary copy
+ * is performed. Source and destination must not overlap.
+ */
+ fax_status FAX_CALL fax_dither_lut(
+    fax_src_ptr src,
+    fax_index width,
+    fax_index height,
+    fax_index src_stride,
+    fax_dst_ptr dst,
+    fax_index dst_stride,
+    fax_table_ptr lut,
+    int serpentine,
+    fax_work_ptr row_a,
+    fax_work_ptr row_b);
+
+extern const fax_u8 FAX_TABLE_QUAL fax_gamma_lut[256];
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* FAX_CORE_H */

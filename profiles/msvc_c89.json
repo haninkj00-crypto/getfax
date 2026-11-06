@@ -1,0 +1,29 @@
+{
+  "name": "msvc_c89",
+  "description": "Microsoft Visual C/C++ compiler in C mode",
+  "compiler_id": "msvc",
+  "standard": "C89-compatible subset",
+  "memory_model": "flat",
+  "image_qualifier": "",
+  "work_qualifier": "",
+  "table_qualifier": "",
+  "inline_keyword": "__inline",
+  "calling_convention": "",
+  "restrict_keyword": "",
+  "compile_command": "cl /nologo /TC /W4 /O2 /DFAX_WITH_PNG /DFAX_WITH_JPEG /DFAX_WITH_TIFF /I<codec-include> fax_core.c fax_engine.c fax_g3.c fax_image.c fax_tables.c fax_thread.c fax_default_params.c fax_engine_test.c /link <static-codec-libraries> /OUT:fax_engine_test.exe",
+  "version_command": "cl",
+  "notes": [
+    "Use the Visual Studio Developer Command Prompt so cl.exe and the standard headers are on PATH.",
+    "The generated core uses a C89-compatible subset; /TC selects C compilation.",
+    "Compiler warning policy can be tightened after the first successful build.",
+    "The engine performs no heap allocation; the host supplies its workspace. The convenience test driver uses malloc and standard file I/O.",
+    "The optimizer and image transforms use C math functions (pow, exp, sqrt, floor, fmod); ensure the toolchain links its math runtime.",
+    "The image adapter calls libpng, libjpeg-turbo and libtiff in-process. Configure include/library paths for the versions installed in the Developer Command Prompt.",
+    "Prefer static codec libraries when distributing a single executable. No ImageMagick/ffmpeg-style converter process or temporary PGM is used.",
+    "Omit codec defines and fax_image codec link libraries to retain built-in PGM/BMP input only."
+  ],
+  "cpu_architecture": "Developer Prompt target architecture (Win32/x64/ARM64)",
+  "compiler_version_target": "Visual Studio 2015+ recommended; C mode",
+  "endianness": "native compiler target; no byte-order assumptions in the core",
+  "threads": "win32"
+}

@@ -1,0 +1,190 @@
+#include "fax_core.h"
+
+fax_status FAX_CALL fax_dither_stream_init(
+    fax_dither_state *state,
+    fax_src_ptr first_input_row,
+    fax_index width,
+    fax_table_ptr lut,
+    int serpentine,
+    fax_work_ptr row_a,
+    fax_work_ptr row_b)
+{
+    fax_index x;
+
+    if (state == (fax_dither_state *)0 ||
+        first_input_row == (fax_src_ptr)0 ||
+        row_a == (fax_work_ptr)0 || row_b == (fax_work_ptr)0 ||
+        row_a == row_b) {
+        return FAX_STATUS_INVALID_ARGUMENT;
+    }
+    if (width == 0UL) {
+        return FAX_STATUS_INVALID_DIMENSIONS;
+    }
+
+    state->width = width;
+    state->row_index = 0UL;
+    state->current_row = row_a;
+    state->next_row = row_b;
+    state->lut = lut;
+    state->serpentine = (serpentine != 0);
+
+    for (x = 0UL; x < width; ++x) {
+        if (lut != (fax_table_ptr)0) {
+            state->current_row[x] = (fax_f32)lut[first_input_row[x]];
+        } else {
+            state->current_row[x] = (fax_f32)first_input_row[x];
+        }
+    }
+
+    return FAX_STATUS_OK;
+}
+
+fax_status FAX_CALL fax_dither_stream_process_row(
+    fax_dither_state *state,
+    fax_src_ptr next_input_row,
+    int has_next,
+    fax_dst_ptr output_row)
+{
+    fax_index x;
+    fax_index j;
+    fax_work_ptr cur;
+    fax_work_ptr nxt;
+    fax_work_ptr tmp;
+    fax_f32 old_value;
+    fax_f32 new_value;
+    fax_f32 error_value;
+    int reverse;
+
+    if (state == (fax_dither_state *)0 || output_row == (fax_dst_ptr)0 ||
+        state->current_row == (fax_work_ptr)0 ||
+        state->next_row == (fax_work_ptr)0 || state->width == 0UL) {
+        return FAX_STATUS_INVALID_ARGUMENT;
+    }
+    if (has_next != 0 && next_input_row == (fax_src_ptr)0) {
+        return FAX_STATUS_INVALID_ARGUMENT;
+    }
+
+    cur = state->current_row;
+    nxt = state->next_row;
+    if (has_next != 0) {
+        for (x = 0UL; x < state->width; ++x) {
+            if (state->lut != (fax_table_ptr)0) {
+                nxt[x] = (fax_f32)state->lut[next_input_row[x]];
+            } else {
+                nxt[x] = (fax_f32)next_input_row[x];
+            }
+        }
+    }
+
+    reverse = (state->serpentine != 0 && (state->row_index & 1UL) != 0UL);
+    for (j = 0UL; j < state->width; ++j) {
+        if (reverse != 0) {
+            x = state->width - 1UL - j;
+        } else {
+            x = j;
+        }
+
+        old_value = cur[x];
+        if (old_value < 128.0f) {
+            new_value = 0.0f;
+            output_row[x] = (fax_u8)0;
+        } else {
+            new_value = 255.0f;
+            output_row[x] = (fax_u8)255;
+        }
+        error_value = old_value - new_value;
+
+        if (reverse == 0) {
+            if (x + 1UL < state->width) {
+                cur[x + 1UL] += error_value * (7.0f / 16.0f);
+            }
+            if (has_next != 0) {
+                if (x > 0UL) {
+                    nxt[x - 1UL] += error_value * (3.0f / 16.0f);
+                }
+                nxt[x] += error_value * (5.0f / 16.0f);
+                if (x + 1UL < state->width) {
+                    nxt[x + 1UL] += error_value * (1.0f / 16.0f);
+                }
+            }
+        } else {
+            if (x > 0UL) {
+                cur[x - 1UL] += error_value * (7.0f / 16.0f);
+            }
+            if (has_next != 0) {
+                if (x + 1UL < state->width) {
+                    nxt[x + 1UL] += error_value * (3.0f / 16.0f);
+                }
+                nxt[x] += error_value * (5.0f / 16.0f);
+                if (x > 0UL) {
+                    nxt[x - 1UL] += error_value * (1.0f / 16.0f);
+                }
+            }
+        }
+    }
+
+    tmp = state->current_row;
+    state->current_row = state->next_row;
+    state->next_row = tmp;
+    state->row_index += 1UL;
+    return FAX_STATUS_OK;
+}
+
+fax_status FAX_CALL fax_dither_lut(
+    fax_src_ptr src,
+    fax_index width,
+    fax_index height,
+    fax_index src_stride,
+    fax_dst_ptr dst,
+    fax_index dst_stride,
+    fax_table_ptr lut,
+    int serpentine,
+    fax_work_ptr row_a,
+    fax_work_ptr row_b)
+{
+    fax_index y;
+    fax_src_ptr src_row;
+    fax_src_ptr next_input_row;
+    fax_dst_ptr dst_row;
+    int has_next;
+    fax_status status;
+    fax_dither_state state;
+
+    if (src == (fax_src_ptr)0 || dst == (fax_dst_ptr)0 ||
+        row_a == (fax_work_ptr)0 || row_b == (fax_work_ptr)0) {
+        return FAX_STATUS_INVALID_ARGUMENT;
+    }
+    if (width == 0UL || height == 0UL) {
+        return FAX_STATUS_INVALID_DIMENSIONS;
+    }
+    if (src_stride < width || dst_stride < width) {
+        return FAX_STATUS_INVALID_STRIDE;
+    }
+
+    status = fax_dither_stream_init(
+        &state, src, width, lut, serpentine, row_a, row_b);
+    if (status != FAX_STATUS_OK) {
+        return status;
+    }
+
+    src_row = src;
+    dst_row = dst;
+    for (y = 0UL; y < height; ++y) {
+        has_next = (y + 1UL < height);
+        next_input_row = (fax_src_ptr)0;
+        if (has_next != 0) {
+            next_input_row = src_row + src_stride;
+        }
+        status = fax_dither_stream_process_row(
+            &state, next_input_row, has_next, dst_row);
+        if (status != FAX_STATUS_OK) {
+            return status;
+        }
+        if (has_next != 0) {
+            src_row += src_stride;
+            dst_row += dst_stride;
+        }
+    }
+
+    return FAX_STATUS_OK;
+}

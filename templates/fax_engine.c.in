@@ -1,0 +1,1252 @@
+#include "fax_engine.h"
+#include "fax_thread.h"
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define FAX_PI 3.14159265358979323846
+#define FAX_MAX_CANDIDATES 512UL
+#define FAX_EPSILON 0.000001
+
+typedef struct fax_score_context {
+    double mean_gray;
+    double std_gray;
+    double mean_detail;
+    double std_detail;
+    double p50;
+    double p90;
+    double target_black;
+    fax_index hi_count;
+    fax_index lo_count;
+} fax_score_context;
+
+static FAX_INLINE double fax_min_double(double a, double b)
+{
+    return (a < b) ? a : b;
+}
+
+static FAX_INLINE double fax_max_double(double a, double b)
+{
+    return (a > b) ? a : b;
+}
+
+static FAX_INLINE double fax_clamp_double(double x, double low, double high)
+{
+    if (x < low) return low;
+    if (x > high) return high;
+    return x;
+}
+
+static FAX_INLINE double fax_round_even(double value)
+{
+    double lower;
+    double fraction;
+    lower = floor(value);
+    fraction = value - lower;
+    if (fraction > 0.5) return lower + 1.0;
+    if (fraction < 0.5) return lower;
+    if (fmod(lower, 2.0) == 0.0) return lower;
+    return lower + 1.0;
+}
+
+static fax_index fax_border_index(long position, fax_index length, int replicate)
+{
+    long n;
+    n = (long)length;
+    if (n <= 1L) return 0UL;
+    if (replicate != 0) {
+        if (position < 0L) return 0UL;
+        if (position >= n) return length - 1UL;
+        return (fax_index)position;
+    }
+    while (position < 0L || position >= n) {
+        if (position < 0L) position = -position;
+        else position = 2L * n - position - 2L;
+    }
+    return (fax_index)position;
+}
+
+static fax_engine_status fax_make_kernel(double sigma, fax_work_ptr kernel,
+                                         fax_index kernel_capacity,
+                                         fax_index *radius_out)
+{
+    fax_index radius;
+    fax_index i;
+    double sum;
+    double value;
+    if (kernel == (fax_work_ptr)0 || radius_out == (fax_index *)0 || sigma < 0.0) {
+        return FAX_ENGINE_INVALID_ARGUMENT;
+    }
+    if (sigma == 0.0) {
+        if (kernel_capacity < 1UL) return FAX_ENGINE_INSUFFICIENT_WORKSPACE;
+        kernel[0] = 1.0f;
+        *radius_out = 0UL;
+        return FAX_ENGINE_OK;
+    }
+    radius = (fax_index)ceil(3.0 * sigma);
+    if (radius > FAX_GAUSSIAN_MAX_RADIUS || radius + 1UL > kernel_capacity) {
+        return FAX_ENGINE_NUMERIC_RANGE;
+    }
+    sum = 0.0;
+    for (i = 0UL; i <= radius; ++i) {
+        value = exp(-((double)i * (double)i) / (2.0 * sigma * sigma));
+        kernel[i] = (fax_f32)value;
+        if (i == 0UL) sum += value;
+        else sum += 2.0 * value;
+    }
+    for (i = 0UL; i <= radius; ++i) {
+        kernel[i] = (fax_f32)((double)kernel[i] / sum);
+    }
+    *radius_out = radius;
+    return FAX_ENGINE_OK;
+}
+
+fax_engine_status FAX_CALL fax_engine_validate_workspace(
+    fax_index width, fax_index height,
+    const fax_engine_workspace *workspace)
+{
+    fax_index pixels;
+    if (workspace == (const fax_engine_workspace *)0) {
+        return FAX_ENGINE_INVALID_ARGUMENT;
+    }
+    if (width == 0UL || height == 0UL || width > 0xffffffffUL / height) {
+        return FAX_ENGINE_INVALID_DIMENSIONS;
+    }
+    pixels = width * height;
+    if (workspace->capacity_pixels < pixels ||
+        workspace->capacity_width < width ||
+        workspace->capacity_height < height) {
+        return FAX_ENGINE_INSUFFICIENT_WORKSPACE;
+    }
+    if (workspace->detail_ref == (fax_work_u8_ptr)0 ||
+        workspace->work_tmp == (fax_work_ptr)0 ||
+        workspace->reconstruction == (fax_work_ptr)0 ||
+        workspace->base_image == (fax_work_u8_ptr)0 ||
+        workspace->binary_image == (fax_work_u8_ptr)0 ||
+        workspace->dither_row_a == (fax_work_ptr)0 ||
+        workspace->dither_row_b == (fax_work_ptr)0 ||
+        workspace->clahe_maps == (fax_work_u8_ptr)0 ||
+        workspace->gaussian_kernel == (fax_work_ptr)0) {
+        return FAX_ENGINE_INVALID_ARGUMENT;
+    }
+    return FAX_ENGINE_OK;
+}
+
+fax_engine_status FAX_CALL fax_gaussian_blur_f32(
+    fax_const_work_ptr source, fax_work_ptr destination, fax_work_ptr temporary,
+    fax_index width, fax_index height, fax_index source_stride,
+    fax_index destination_stride, double sigma, int border_replicate,
+    fax_work_ptr kernel, fax_index kernel_capacity)
+{
+    fax_index x;
+    fax_index y;
+    fax_index k;
+    fax_index radius;
+    fax_index sample_x;
+    fax_index sample_y;
+    double sum;
+    fax_engine_status status;
+    if (source == (fax_const_work_ptr)0 || destination == (fax_work_ptr)0 ||
+        temporary == (fax_work_ptr)0 || width == 0UL || height == 0UL ||
+        source_stride < width || destination_stride < width) {
+        return FAX_ENGINE_INVALID_ARGUMENT;
+    }
+    status = fax_make_kernel(sigma, kernel, kernel_capacity, &radius);
+    if (status != FAX_ENGINE_OK) return status;
+    if (sigma == 0.0) {
+        for (y = 0UL; y < height; ++y) {
+            for (x = 0UL; x < width; ++x) {
+                destination[y * destination_stride + x] =
+                    source[y * source_stride + x];
+            }
+        }
+        return FAX_ENGINE_OK;
+    }
+    for (y = 0UL; y < height; ++y) {
+        for (x = 0UL; x < width; ++x) {
+            sum = (double)source[y * source_stride + x] * (double)kernel[0];
+            for (k = 1UL; k <= radius; ++k) {
+                sample_x = fax_border_index((long)x - (long)k, width, border_replicate);
+                sum += (double)source[y * source_stride + sample_x] * (double)kernel[k];
+                sample_x = fax_border_index((long)x + (long)k, width, border_replicate);
+                sum += (double)source[y * source_stride + sample_x] * (double)kernel[k];
+            }
+            temporary[y * width + x] = (fax_f32)sum;
+        }
+    }
+    for (y = 0UL; y < height; ++y) {
+        for (x = 0UL; x < width; ++x) {
+            sum = (double)temporary[y * width + x] * (double)kernel[0];
+            for (k = 1UL; k <= radius; ++k) {
+                sample_y = fax_border_index((long)y - (long)k, height, border_replicate);
+                sum += (double)temporary[sample_y * width + x] * (double)kernel[k];
+                sample_y = fax_border_index((long)y + (long)k, height, border_replicate);
+                sum += (double)temporary[sample_y * width + x] * (double)kernel[k];
+            }
+            destination[y * destination_stride + x] = (fax_f32)sum;
+        }
+    }
+    return FAX_ENGINE_OK;
+}
+
+ fax_engine_status FAX_CALL fax_gaussian_blur_u8_f32(
+    fax_src_ptr source, fax_work_ptr destination, fax_work_ptr temporary,
+    fax_index width, fax_index height, fax_index source_stride,
+    fax_index destination_stride, double sigma, int border_replicate,
+    fax_work_ptr kernel, fax_index kernel_capacity)
+{
+    fax_index x;
+    fax_index y;
+    fax_index k;
+    fax_index radius;
+    fax_index sample_x;
+    fax_index sample_y;
+    double sum;
+    fax_engine_status status;
+    if (source == (fax_src_ptr)0 || destination == (fax_work_ptr)0 ||
+        temporary == (fax_work_ptr)0 || width == 0UL || height == 0UL ||
+        source_stride < width || destination_stride < width) {
+        return FAX_ENGINE_INVALID_ARGUMENT;
+    }
+    status = fax_make_kernel(sigma, kernel, kernel_capacity, &radius);
+    if (status != FAX_ENGINE_OK) return status;
+    if (sigma == 0.0) {
+        for (y = 0UL; y < height; ++y) {
+            for (x = 0UL; x < width; ++x) {
+                destination[y * destination_stride + x] =
+                    (fax_f32)source[y * source_stride + x];
+            }
+        }
+        return FAX_ENGINE_OK;
+    }
+    for (y = 0UL; y < height; ++y) {
+        for (x = 0UL; x < width; ++x) {
+            sum = (double)source[y * source_stride + x] * (double)kernel[0];
+            for (k = 1UL; k <= radius; ++k) {
+                sample_x = fax_border_index((long)x - (long)k, width, border_replicate);
+                sum += (double)source[y * source_stride + sample_x] * (double)kernel[k];
+                sample_x = fax_border_index((long)x + (long)k, width, border_replicate);
+                sum += (double)source[y * source_stride + sample_x] * (double)kernel[k];
+            }
+            temporary[y * width + x] = (fax_f32)sum;
+        }
+    }
+    for (y = 0UL; y < height; ++y) {
+        for (x = 0UL; x < width; ++x) {
+            sum = (double)temporary[y * width + x] * (double)kernel[0];
+            for (k = 1UL; k <= radius; ++k) {
+                sample_y = fax_border_index((long)y - (long)k, height, border_replicate);
+                sum += (double)temporary[sample_y * width + x] * (double)kernel[k];
+                sample_y = fax_border_index((long)y + (long)k, height, border_replicate);
+                sum += (double)temporary[sample_y * width + x] * (double)kernel[k];
+            }
+            destination[y * destination_stride + x] = (fax_f32)sum;
+        }
+    }
+    return FAX_ENGINE_OK;
+}
+
+static void fax_make_gamma_lut(double gamma, fax_u8 lut[256])
+{
+    int i;
+    double value;
+    if (gamma == 1.0) {
+        for (i = 0; i < 256; ++i) lut[i] = (fax_u8)i;
+        return;
+    }
+    for (i = 0; i < 256; ++i) {
+        value = pow((double)i / 255.0, gamma) * 255.0;
+        value = fax_clamp_double(fax_round_even(value), 0.0, 255.0);
+        lut[i] = (fax_u8)value;
+    }
+}
+
+static void fax_apply_gamma(fax_const_work_u8_ptr source, fax_index source_stride,
+                            fax_dst_ptr destination, fax_index destination_stride,
+                            fax_index width, fax_index height, double gamma)
+{
+    fax_u8 lut[256];
+    fax_index x;
+    fax_index y;
+    fax_make_gamma_lut(gamma, lut);
+    for (y = 0UL; y < height; ++y) {
+        for (x = 0UL; x < width; ++x) {
+            destination[y * destination_stride + x] = lut[source[y * source_stride + x]];
+        }
+    }
+}
+
+fax_engine_status FAX_CALL fax_local_dark_enhance(
+    fax_src_ptr gray, fax_index width, fax_index height, fax_index stride,
+    double sigma, double strength, double floor_value, double gamma,
+    fax_dst_ptr destination, fax_index destination_stride,
+    fax_engine_workspace *workspace)
+{
+    fax_index x;
+    fax_index y;
+    fax_index pos;
+    double diff;
+    double value;
+    fax_engine_status status;
+    if (gray == (fax_src_ptr)0 || destination == (fax_dst_ptr)0 ||
+        workspace == (fax_engine_workspace *)0 || stride < width ||
+        destination_stride < width || sigma <= 0.0 || strength < 0.0 ||
+        floor_value < 0.0 || gamma <= 0.0) return FAX_ENGINE_INVALID_ARGUMENT;
+    status = fax_engine_validate_workspace(width, height, workspace);
+    if (status != FAX_ENGINE_OK) return status;
+    status = fax_gaussian_blur_u8_f32(gray, workspace->reconstruction,
+        workspace->work_tmp, width, height, stride, width, sigma, 0,
+        workspace->gaussian_kernel, FAX_GAUSSIAN_MAX_RADIUS + 1UL);
+    if (status != FAX_ENGINE_OK) return status;
+    for (y = 0UL; y < height; ++y) {
+        for (x = 0UL; x < width; ++x) {
+            pos = y * width + x;
+            diff = (double)workspace->reconstruction[pos] - (double)gray[y * stride + x];
+            if (diff < 0.0) diff = 0.0;
+            diff -= floor_value;
+            if (diff < 0.0) diff = 0.0;
+            value = (double)gray[y * stride + x] - strength * diff;
+            value = fax_clamp_double(fax_round_even(value), 0.0, 255.0);
+            workspace->base_image[pos] = (fax_u8)value;
+        }
+    }
+    fax_apply_gamma(workspace->base_image, width, destination,
+                    destination_stride, width, height, gamma);
+    return FAX_ENGINE_OK;
+}
+
+static void fax_clahe_build_maps(fax_src_ptr gray, fax_index width,
+                                 fax_index height, fax_index stride,
+                                 double clip_limit, fax_work_u8_ptr maps)
+{
+    int tiles_x;
+    int tiles_y;
+    int tx;
+    int ty;
+    int i;
+    long x0;
+    long x1;
+    long y0;
+    long y1;
+    long area;
+    long clip_count;
+    long excess;
+    long batch;
+    long residual;
+    long step;
+    long cdf;
+    long x;
+    long y;
+    long histogram[256];
+    fax_work_u8_ptr map;
+    tiles_x = (width < FAX_CLAHE_TILES_X) ? (int)width : FAX_CLAHE_TILES_X;
+    tiles_y = (height < FAX_CLAHE_TILES_Y) ? (int)height : FAX_CLAHE_TILES_Y;
+    if (tiles_x < 1) tiles_x = 1;
+    if (tiles_y < 1) tiles_y = 1;
+    for (ty = 0; ty < tiles_y; ++ty) {
+        y0 = ((long)ty * (long)height) / (long)tiles_y;
+        y1 = ((long)(ty + 1) * (long)height) / (long)tiles_y;
+        for (tx = 0; tx < tiles_x; ++tx) {
+            x0 = ((long)tx * (long)width) / (long)tiles_x;
+            x1 = ((long)(tx + 1) * (long)width) / (long)tiles_x;
+            area = (x1 - x0) * (y1 - y0);
+            memset(histogram, 0, sizeof(histogram));
+            for (y = y0; y < y1; ++y) {
+                for (x = x0; x < x1; ++x) ++histogram[gray[(fax_index)y * stride + (fax_index)x]];
+            }
+            clip_count = (long)(clip_limit * (double)area / 256.0);
+            if (clip_count < 1) clip_count = 1;
+            excess = 0;
+            for (i = 0; i < 256; ++i) {
+                if (histogram[i] > clip_count) {
+                    excess += histogram[i] - clip_count;
+                    histogram[i] = clip_count;
+                }
+            }
+            batch = excess / 256;
+            residual = excess - batch * 256;
+            for (i = 0; i < 256; ++i) histogram[i] += batch;
+            if (residual > 0) {
+                step = 256 / residual;
+                if (step < 1) step = 1;
+                i = 0;
+                while (residual > 0 && i < 256) {
+                    ++histogram[i];
+                    --residual;
+                    i += step;
+                }
+                i = 0;
+                while (residual > 0) {
+                    ++histogram[i];
+                    --residual;
+                    ++i;
+                    if (i >= 256) i = 0;
+                }
+            }
+            cdf = 0;
+            map = maps + ((ty * FAX_CLAHE_TILES_X + tx) * 256);
+            for (i = 0; i < 256; ++i) {
+                cdf += histogram[i];
+                map[i] = (fax_u8)fax_clamp_double(
+                    fax_round_even((double)cdf * 255.0 / (double)area), 0.0, 255.0);
+            }
+        }
+    }
+}
+
+static void fax_clahe_apply_maps(fax_src_ptr gray, fax_index width,
+                                 fax_index height, fax_index stride,
+                                 fax_dst_ptr destination, fax_index destination_stride,
+                                 int tiles_x, int tiles_y, fax_const_work_u8_ptr maps)
+{
+    fax_index x;
+    fax_index y;
+    int tx0;
+    int tx1;
+    int ty0;
+    int ty1;
+    double txf;
+    double tyf;
+    double wx;
+    double wy;
+    double top;
+    double bottom;
+    double value;
+    int pixel;
+    fax_const_work_u8_ptr m00;
+    fax_const_work_u8_ptr m10;
+    fax_const_work_u8_ptr m01;
+    fax_const_work_u8_ptr m11;
+    for (y = 0UL; y < height; ++y) {
+        tyf = (((double)y + 0.5) * (double)tiles_y / (double)height) - 0.5;
+        ty0 = (int)floor(tyf);
+        wy = tyf - (double)ty0;
+        if (ty0 < 0) { ty0 = 0; wy = 0.0; }
+        ty1 = ty0 + 1;
+        if (ty1 >= tiles_y) { ty1 = tiles_y - 1; wy = 0.0; }
+        for (x = 0UL; x < width; ++x) {
+            txf = (((double)x + 0.5) * (double)tiles_x / (double)width) - 0.5;
+            tx0 = (int)floor(txf);
+            wx = txf - (double)tx0;
+            if (tx0 < 0) { tx0 = 0; wx = 0.0; }
+            tx1 = tx0 + 1;
+            if (tx1 >= tiles_x) { tx1 = tiles_x - 1; wx = 0.0; }
+            pixel = (int)gray[y * stride + x];
+            m00 = maps + ((ty0 * FAX_CLAHE_TILES_X + tx0) * 256);
+            m10 = maps + ((ty0 * FAX_CLAHE_TILES_X + tx1) * 256);
+            m01 = maps + ((ty1 * FAX_CLAHE_TILES_X + tx0) * 256);
+            m11 = maps + ((ty1 * FAX_CLAHE_TILES_X + tx1) * 256);
+            top = (1.0 - wx) * (double)m00[pixel] + wx * (double)m10[pixel];
+            bottom = (1.0 - wx) * (double)m01[pixel] + wx * (double)m11[pixel];
+            value = (1.0 - wy) * top + wy * bottom;
+            destination[y * destination_stride + x] = (fax_u8)fax_clamp_double(
+                fax_round_even(value), 0.0, 255.0);
+        }
+    }
+}
+
+fax_engine_status FAX_CALL fax_clahe_enhance(
+    fax_src_ptr gray, fax_index width, fax_index height, fax_index stride,
+    double clip_limit, double gamma,
+    fax_dst_ptr destination, fax_index destination_stride,
+    fax_engine_workspace *workspace)
+{
+    int tiles_x;
+    int tiles_y;
+    fax_engine_status status;
+    if (gray == (fax_src_ptr)0 || destination == (fax_dst_ptr)0 ||
+        workspace == (fax_engine_workspace *)0 || stride < width ||
+        destination_stride < width || clip_limit <= 0.0 || gamma <= 0.0) {
+        return FAX_ENGINE_INVALID_ARGUMENT;
+    }
+    status = fax_engine_validate_workspace(width, height, workspace);
+    if (status != FAX_ENGINE_OK) return status;
+    tiles_x = (width < FAX_CLAHE_TILES_X) ? (int)width : FAX_CLAHE_TILES_X;
+    tiles_y = (height < FAX_CLAHE_TILES_Y) ? (int)height : FAX_CLAHE_TILES_Y;
+    if (tiles_x < 1) tiles_x = 1;
+    if (tiles_y < 1) tiles_y = 1;
+    fax_clahe_build_maps(gray, width, height, stride, clip_limit,
+                         workspace->clahe_maps);
+    fax_clahe_apply_maps(gray, width, height, stride,
+                         workspace->base_image, width,
+                         tiles_x, tiles_y, workspace->clahe_maps);
+    fax_apply_gamma(workspace->base_image, width, destination,
+                    destination_stride, width, height, gamma);
+    return FAX_ENGINE_OK;
+}
+
+static fax_engine_status fax_prepare_score_context(
+    fax_src_ptr gray, fax_index width, fax_index height, fax_index stride,
+    double detail_sigma, fax_engine_workspace *workspace,
+    fax_score_context *context)
+{
+    fax_index x;
+    fax_index y;
+    fax_index pos;
+    fax_index count;
+    fax_index histogram[256];
+    fax_index lower_index;
+    fax_index upper_index;
+    fax_index cumulative;
+    double sum;
+    double sum2;
+    double value;
+    double low_fraction;
+    double high_fraction;
+    double position;
+    fax_engine_status status;
+    if (gray == (fax_src_ptr)0 || context == (fax_score_context *)0 ||
+        stride < width) return FAX_ENGINE_INVALID_ARGUMENT;
+    count = width * height;
+    sum = 0.0;
+    sum2 = 0.0;
+    for (y = 0UL; y < height; ++y) {
+        for (x = 0UL; x < width; ++x) {
+            value = (double)gray[y * stride + x];
+            sum += value;
+            sum2 += value * value;
+        }
+    }
+    context->mean_gray = sum / (double)count;
+    context->std_gray = sqrt(fax_max_double(0.0, sum2 / (double)count -
+                         context->mean_gray * context->mean_gray));
+    status = fax_gaussian_blur_u8_f32(gray, workspace->reconstruction,
+        workspace->work_tmp, width, height, stride, width, detail_sigma, 0,
+        workspace->gaussian_kernel, FAX_GAUSSIAN_MAX_RADIUS + 1UL);
+    if (status != FAX_ENGINE_OK) return status;
+    sum = 0.0;
+    sum2 = 0.0;
+    memset(histogram, 0, sizeof(histogram));
+    for (y = 0UL; y < height; ++y) {
+        for (x = 0UL; x < width; ++x) {
+            pos = y * width + x;
+            value = fax_round_even((double)workspace->reconstruction[pos]);
+            value = fax_clamp_double(value - (double)gray[y * stride + x], 0.0, 255.0);
+            workspace->detail_ref[pos] = (fax_u8)value;
+            sum += value;
+            sum2 += value * value;
+            ++histogram[(int)value];
+        }
+    }
+    context->mean_detail = sum / (double)count;
+    context->std_detail = sqrt(fax_max_double(0.0, sum2 / (double)count -
+                           context->mean_detail * context->mean_detail));
+    position = (double)(count - 1UL) * 0.50;
+    lower_index = (fax_index)floor(position);
+    upper_index = lower_index + 1UL;
+    low_fraction = position - (double)lower_index;
+    cumulative = 0UL;
+    context->p50 = 0.0;
+    {
+        fax_index found_low;
+        fax_index found_high;
+        int value_index;
+        found_low = 0UL;
+        found_high = 0UL;
+        for (value_index = 0; value_index < 256; ++value_index) {
+            cumulative += histogram[value_index];
+            if (found_low == 0UL && cumulative > lower_index) {
+                context->p50 = (double)value_index * (1.0 - low_fraction);
+                found_low = 1UL;
+            }
+            if (cumulative > upper_index) {
+                context->p50 += (double)value_index * low_fraction;
+                found_high = 1UL;
+                break;
+            }
+        }
+        if (found_low != 0UL && found_high == 0UL) context->p50 += 255.0 * low_fraction;
+    }
+    position = (double)(count - 1UL) * 0.90;
+    lower_index = (fax_index)floor(position);
+    upper_index = lower_index + 1UL;
+    high_fraction = position - (double)lower_index;
+    cumulative = 0UL;
+    context->p90 = 0.0;
+    {
+        fax_index found_low;
+        fax_index found_high;
+        int value_index;
+        found_low = 0UL;
+        found_high = 0UL;
+        for (value_index = 0; value_index < 256; ++value_index) {
+            cumulative += histogram[value_index];
+            if (found_low == 0UL && cumulative > lower_index) {
+                context->p90 = (double)value_index * (1.0 - high_fraction);
+                found_low = 1UL;
+            }
+            if (cumulative > upper_index) {
+                context->p90 += (double)value_index * high_fraction;
+                found_high = 1UL;
+                break;
+            }
+        }
+        if (found_low != 0UL && found_high == 0UL) context->p90 += 255.0 * high_fraction;
+    }
+    context->hi_count = 0UL;
+    context->lo_count = 0UL;
+    for (pos = 0UL; pos < count; ++pos) {
+        if ((double)workspace->detail_ref[pos] >= context->p90) ++context->hi_count;
+        if ((double)workspace->detail_ref[pos] <= context->p50) ++context->lo_count;
+    }
+    context->target_black = ((255.0 - context->mean_gray) / 255.0) * 100.0 + 1.5;
+    return FAX_ENGINE_OK;
+}
+
+static fax_engine_status fax_score_internal(
+    fax_src_ptr gray, fax_index width, fax_index height, fax_index stride,
+    fax_src_ptr binary, fax_index binary_stride, double recon_sigma,
+    fax_engine_workspace *workspace, const fax_score_context *context,
+    fax_metrics *metrics)
+{
+    fax_index x;
+    fax_index y;
+    fax_index pos;
+    fax_index count;
+    double sum;
+    double sum2;
+    double mae_sum;
+    double cov_gray;
+    double cov_detail;
+    double hi_dark;
+    double lo_dark;
+    double ratio;
+    double mean_recon;
+    double std_recon;
+    double mae;
+    double ncc;
+    double dark_corr;
+    double black;
+    double bias;
+    double fidelity;
+    double detail;
+    double coverage;
+    double total;
+    double value;
+    fax_engine_status status;
+    if (gray == (fax_src_ptr)0 || binary == (fax_src_ptr)0 ||
+        metrics == (fax_metrics *)0 || stride < width ||
+        binary_stride < width || recon_sigma < 0.0) {
+        return FAX_ENGINE_INVALID_ARGUMENT;
+    }
+    count = width * height;
+    if (recon_sigma == 0.0) {
+        for (y = 0UL; y < height; ++y) {
+            for (x = 0UL; x < width; ++x) {
+                workspace->reconstruction[y * width + x] =
+                    (binary[y * binary_stride + x] == 0) ? 0.0f : 255.0f;
+            }
+        }
+    } else {
+        status = fax_gaussian_blur_u8_f32(binary, workspace->reconstruction,
+            workspace->work_tmp, width, height, binary_stride, width,
+            recon_sigma, 1, workspace->gaussian_kernel,
+            FAX_GAUSSIAN_MAX_RADIUS + 1UL);
+        if (status != FAX_ENGINE_OK) return status;
+        for (pos = 0UL; pos < count; ++pos) {
+            workspace->reconstruction[pos] = (fax_f32)fax_clamp_double(
+                fax_round_even((double)workspace->reconstruction[pos]), 0.0, 255.0);
+        }
+    }
+    sum = 0.0;
+    sum2 = 0.0;
+    mae_sum = 0.0;
+    for (y = 0UL; y < height; ++y) {
+        for (x = 0UL; x < width; ++x) {
+            pos = y * width + x;
+            value = (double)workspace->reconstruction[pos];
+            sum += value;
+            sum2 += value * value;
+            mae_sum += fabs(value - (double)gray[y * stride + x]);
+        }
+    }
+    mean_recon = sum / (double)count;
+    std_recon = sqrt(fax_max_double(0.0, sum2 / (double)count -
+                         mean_recon * mean_recon));
+    mae = mae_sum / (double)count;
+    cov_gray = 0.0;
+    cov_detail = 0.0;
+    hi_dark = 0.0;
+    lo_dark = 0.0;
+    black = 0.0;
+    for (y = 0UL; y < height; ++y) {
+        for (x = 0UL; x < width; ++x) {
+            pos = y * width + x;
+            value = (double)workspace->reconstruction[pos] - mean_recon;
+            cov_gray += value * ((double)gray[y * stride + x] - context->mean_gray);
+            cov_detail += value * ((double)workspace->detail_ref[pos] - context->mean_detail);
+            if ((double)workspace->detail_ref[pos] >= context->p90) {
+                hi_dark += 255.0 - (double)workspace->reconstruction[pos];
+            }
+            if ((double)workspace->detail_ref[pos] <= context->p50) {
+                lo_dark += 255.0 - (double)workspace->reconstruction[pos];
+            }
+            if (binary[y * binary_stride + x] == 0) black += 1.0;
+        }
+    }
+    if (count < 2UL || std_recon < 1.0e-8 || context->std_gray < 1.0e-8) ncc = 0.0;
+    else ncc = cov_gray / ((double)count * std_recon * context->std_gray);
+    if (count < 2UL || std_recon < 1.0e-8 || context->std_detail < 1.0e-8) dark_corr = 0.0;
+    else dark_corr = -cov_detail / ((double)count * std_recon * context->std_detail);
+    hi_dark = (context->hi_count != 0UL) ? hi_dark / (double)context->hi_count : 0.0;
+    lo_dark = (context->lo_count != 0UL) ? lo_dark / (double)context->lo_count : 0.0;
+    ratio = hi_dark / fax_max_double(lo_dark, 1.0);
+    black = black / (double)count * 100.0;
+    bias = mean_recon - context->mean_gray;
+    fidelity = 0.60 * fax_clamp_double(1.0 - mae / 45.0, 0.0, 1.0) +
+               0.40 * fax_clamp_double((ncc - 0.70) / 0.30, 0.0, 1.0);
+    detail = 0.60 * fax_clamp_double((dark_corr - 0.45) / 0.45, 0.0, 1.0) +
+             0.40 * fax_clamp_double((ratio - 1.0) / 9.0, 0.0, 1.0);
+    coverage = exp(-0.5 * ((black - context->target_black) / 4.0) *
+                            ((black - context->target_black) / 4.0));
+    total = 100.0 * (0.50 * fidelity + 0.40 * detail + 0.10 * coverage);
+    metrics->score = total;
+    metrics->mae = mae;
+    metrics->ncc = ncc;
+    metrics->dark_corr = dark_corr;
+    metrics->detail_ratio = ratio;
+    metrics->black_pct = black;
+    metrics->target_black_pct = context->target_black;
+    metrics->tone_bias = bias;
+    metrics->fidelity_score = fidelity;
+    metrics->detail_score = detail;
+    metrics->coverage_score = coverage;
+    metrics->transitions_per_row = 0.0;
+    for (y = 0UL; y < height; ++y) {
+        for (x = 1UL; x < width; ++x) {
+            if (binary[y * binary_stride + x] != binary[y * binary_stride + x - 1UL]) {
+                metrics->transitions_per_row += 1.0;
+            }
+        }
+    }
+    metrics->transitions_per_row /= (double)height;
+    return FAX_ENGINE_OK;
+}
+
+fax_engine_status FAX_CALL fax_score_binary(
+    fax_src_ptr gray, fax_index width, fax_index height, fax_index stride,
+    double detail_sigma, fax_src_ptr binary, fax_index binary_stride,
+    double recon_sigma, fax_engine_workspace *workspace,
+    fax_metrics *metrics)
+{
+    fax_score_context context;
+    fax_engine_status status;
+    status = fax_engine_validate_workspace(width, height, workspace);
+    if (status != FAX_ENGINE_OK) return status;
+    status = fax_prepare_score_context(gray, width, height, stride,
+                                       detail_sigma, workspace, &context);
+    if (status != FAX_ENGINE_OK) return status;
+    return fax_score_internal(gray, width, height, stride, binary,
+                              binary_stride, recon_sigma, workspace,
+                              &context, metrics);
+}
+
+static int fax_candidate_equal(const fax_candidate *a, const fax_candidate *b)
+{
+    if (a->family != b->family || a->serpentine != b->serpentine) return 0;
+    if (fabs(a->gamma - b->gamma) > FAX_EPSILON) return 0;
+    if (fabs(a->sigma_px - b->sigma_px) > FAX_EPSILON) return 0;
+    if (fabs(a->strength - b->strength) > FAX_EPSILON) return 0;
+    if (fabs(a->floor_value - b->floor_value) > FAX_EPSILON) return 0;
+    if (fabs(a->clip - b->clip) > FAX_EPSILON) return 0;
+    return 1;
+}
+
+static fax_engine_status fax_add_candidate(fax_engine_workspace *workspace,
+                                            fax_index *count,
+                                            fax_index *next_id,
+                                            const fax_candidate *candidate,
+                                            int *added)
+{
+    fax_index i;
+    *added = 0;
+    for (i = 0UL; i < *count; ++i) {
+        if (fax_candidate_equal(&workspace->candidate_entries[i].params, candidate)) return FAX_ENGINE_OK;
+    }
+    if (*count >= workspace->candidate_capacity || *count >= FAX_MAX_CANDIDATES) {
+        return FAX_ENGINE_TOO_MANY_CANDIDATES;
+    }
+    workspace->candidate_entries[*count].candidate_id = *next_id;
+    workspace->candidate_entries[*count].params = *candidate;
+    workspace->candidate_entries[*count].evaluated = 0;
+    ++(*count);
+    ++(*next_id);
+    *added = 1;
+    return FAX_ENGINE_OK;
+}
+
+static fax_engine_status fax_add_simple(fax_engine_workspace *workspace,
+                                        fax_index *count, fax_index *next_id,
+                                        int family, double gamma, int serp,
+                                        double sigma, double strength,
+                                        double floor_value, double clip)
+{
+    fax_candidate candidate;
+    int added;
+    candidate.family = family;
+    candidate.gamma = gamma;
+    candidate.serpentine = serp;
+    candidate.sigma_px = sigma;
+    candidate.strength = strength;
+    candidate.floor_value = floor_value;
+    candidate.clip = clip;
+    return fax_add_candidate(workspace, count, next_id, &candidate, &added);
+}
+
+static fax_engine_status fax_render_internal(
+    fax_src_ptr gray, fax_index width, fax_index height, fax_index stride,
+    const fax_candidate *candidate, fax_engine_workspace *workspace,
+    fax_dst_ptr binary, fax_index binary_stride)
+{
+    fax_index y;
+    fax_engine_status status;
+    if (candidate->family == FAX_FAMILY_GAMMA) {
+        for (y = 0UL; y < height; ++y) {
+            fax_index x;
+            for (x = 0UL; x < width; ++x) {
+                workspace->base_image[y * width + x] = gray[y * stride + x];
+            }
+        }
+        fax_apply_gamma(workspace->base_image, width, workspace->base_image,
+                        width, width, height, candidate->gamma);
+    } else if (candidate->family == FAX_FAMILY_LOCAL_DARK) {
+        status = fax_local_dark_enhance(gray, width, height, stride,
+            candidate->sigma_px, candidate->strength, candidate->floor_value,
+            candidate->gamma, workspace->base_image, width, workspace);
+        if (status != FAX_ENGINE_OK) return status;
+    } else if (candidate->family == FAX_FAMILY_CLAHE) {
+        status = fax_clahe_enhance(gray, width, height, stride,
+            candidate->clip, candidate->gamma, workspace->base_image,
+            width, workspace);
+        if (status != FAX_ENGINE_OK) return status;
+    } else {
+        return FAX_ENGINE_INVALID_ARGUMENT;
+    }
+    status = (fax_engine_status)fax_dither_lut(workspace->base_image,
+        width, height, width, binary, binary_stride, (fax_table_ptr)0,
+        candidate->serpentine, workspace->dither_row_a, workspace->dither_row_b);
+    return (status == (fax_engine_status)FAX_STATUS_OK) ?
+        FAX_ENGINE_OK : FAX_ENGINE_INVALID_ARGUMENT;
+}
+
+fax_engine_status FAX_CALL fax_render_candidate(
+    fax_src_ptr gray, fax_index width, fax_index height, fax_index stride,
+    const fax_candidate *candidate, fax_engine_workspace *workspace,
+    fax_dst_ptr binary, fax_index binary_stride)
+{
+    fax_engine_status status;
+    if (gray == (fax_src_ptr)0 || candidate == (const fax_candidate *)0 ||
+        binary == (fax_dst_ptr)0 || stride < width || binary_stride < width) {
+        return FAX_ENGINE_INVALID_ARGUMENT;
+    }
+    status = fax_engine_validate_workspace(width, height, workspace);
+    if (status != FAX_ENGINE_OK) return status;
+    return fax_render_internal(gray, width, height, stride, candidate,
+                               workspace, binary, binary_stride);
+}
+
+static double fax_sigma_value(double sigma, int which)
+{
+    double value;
+    value = sigma + (double)which;
+    if (value < 1.0) value = 1.0;
+    return value;
+}
+
+static fax_engine_status fax_add_coarse(fax_engine_workspace *workspace,
+                                        fax_index *count, fax_index *next_id,
+                                        double sigma)
+{
+    static const double family_gamma[4] = {1.00, 1.10, 1.20, 1.30};
+    static const double strengths[4] = {0.30, 0.45, 0.70, 1.00};
+    static const double local_gamma[2] = {1.00, 1.10};
+    static const double clips[3] = {0.50, 0.75, 1.00};
+    static const double clahe_gamma[2] = {1.00, 1.20};
+    int i;
+    int j;
+    int k;
+    int serp;
+    int s;
+    fax_engine_status status;
+    for (i = 0; i < 4; ++i) for (serp = 0; serp < 2; ++serp) {
+        status = fax_add_simple(workspace, count, next_id, FAX_FAMILY_GAMMA,
+            family_gamma[i], serp, 0.0, 0.0, 0.0, 0.0);
+        if (status != FAX_ENGINE_OK) return status;
+    }
+    for (s = -1; s <= 1; ++s) {
+        double sig;
+        sig = fax_sigma_value(sigma, s);
+        for (i = 0; i < 4; ++i) for (j = 0; j < 2; ++j) for (serp = 0; serp < 2; ++serp) {
+            status = fax_add_simple(workspace, count, next_id,
+                FAX_FAMILY_LOCAL_DARK, local_gamma[j], serp, sig,
+                strengths[i], 0.0, 0.0);
+            if (status != FAX_ENGINE_OK) return status;
+        }
+    }
+    for (i = 0; i < 3; ++i) for (j = 0; j < 2; ++j) for (serp = 0; serp < 2; ++serp) {
+        status = fax_add_simple(workspace, count, next_id, FAX_FAMILY_CLAHE,
+            clahe_gamma[j], serp, 0.0, 0.0, 0.0, clips[i]);
+        if (status != FAX_ENGINE_OK) return status;
+    }
+    (void)k;
+    return FAX_ENGINE_OK;
+}
+
+static fax_engine_status fax_add_full(fax_engine_workspace *workspace,
+                                      fax_index *count, fax_index *next_id,
+                                      double sigma)
+{
+    static const double family_gamma[7] = {0.95,1.00,1.05,1.10,1.15,1.20,1.25};
+    static const double strengths[10] = {0.30,0.35,0.375,0.40,0.425,0.45,0.475,0.50,0.60,0.80};
+    static const double local_gamma[3] = {1.00,1.05,1.20};
+    static const double floors[2] = {0.0,1.0};
+    static const double clips[6] = {0.50,0.75,1.00,1.25,1.50,1.75};
+    static const double clahe_gamma[3] = {1.00,1.10,1.20};
+    int i;
+    int j;
+    int k;
+    int s;
+    int serp;
+    fax_engine_status status;
+    for (i = 0; i < 7; ++i) for (serp = 0; serp < 2; ++serp) {
+        status = fax_add_simple(workspace, count, next_id, FAX_FAMILY_GAMMA,
+            family_gamma[i], serp, 0.0, 0.0, 0.0, 0.0);
+        if (status != FAX_ENGINE_OK) return status;
+    }
+    for (s = -1; s <= 1; ++s) {
+        double sig;
+        sig = fax_sigma_value(sigma, s);
+        for (i = 0; i < 10; ++i) for (j = 0; j < 2; ++j)
+            for (k = 0; k < 3; ++k) for (serp = 0; serp < 2; ++serp) {
+                status = fax_add_simple(workspace, count, next_id,
+                    FAX_FAMILY_LOCAL_DARK, local_gamma[k], serp, sig,
+                    strengths[i], floors[j], 0.0);
+                if (status != FAX_ENGINE_OK) return status;
+            }
+    }
+    for (i = 0; i < 6; ++i) for (j = 0; j < 3; ++j) for (serp = 0; serp < 2; ++serp) {
+        status = fax_add_simple(workspace, count, next_id, FAX_FAMILY_CLAHE,
+            clahe_gamma[j], serp, 0.0, 0.0, 0.0, clips[i]);
+        if (status != FAX_ENGINE_OK) return status;
+    }
+    return FAX_ENGINE_OK;
+}
+
+static fax_engine_status fax_add_refinement(fax_engine_workspace *workspace,
+                                             fax_index *count,
+                                             fax_index *next_id,
+                                             const fax_candidate *best)
+{
+    static const double local_factors[5] = {0.8,0.9,1.0,1.1,1.25};
+    static const double local_gamma_delta[3] = {-0.05,0.0,0.05};
+    static const double gamma_delta[5] = {-0.1,-0.05,0.0,0.05,0.1};
+    static const double clahe_factors[5] = {0.7,0.85,1.0,1.15,1.4};
+    static const double clahe_gamma_delta[3] = {-0.1,0.0,0.1};
+    int i;
+    int j;
+    int serp;
+    fax_engine_status status;
+    double strength;
+    double gamma;
+    double clip;
+    double sigma;
+    if (best->family == FAX_FAMILY_LOCAL_DARK) {
+        for (i = 0; i < 5; ++i) {
+            strength = fax_min_double(best->strength * local_factors[i], 2.0);
+            for (j = 0; j < 3; ++j) {
+                gamma = fax_max_double(0.8, best->gamma + local_gamma_delta[j]);
+                for (serp = 0; serp < 2; ++serp) {
+                    status = fax_add_simple(workspace, count, next_id,
+                        FAX_FAMILY_LOCAL_DARK, gamma, serp, best->sigma_px,
+                        (double)((long)(strength * 1000.0 + 0.5)) / 1000.0,
+                        best->floor_value, 0.0);
+                    if (status != FAX_ENGINE_OK) return status;
+                }
+            }
+        }
+        for (i = -1; i <= 1; i += 2) {
+            sigma = best->sigma_px + (double)i * 0.5;
+            if (sigma >= 0.5) for (serp = 0; serp < 2; ++serp) {
+                status = fax_add_simple(workspace, count, next_id,
+                    FAX_FAMILY_LOCAL_DARK, best->gamma, serp, sigma,
+                    best->strength, best->floor_value, 0.0);
+                if (status != FAX_ENGINE_OK) return status;
+            }
+        }
+        status = fax_add_simple(workspace, count, next_id,
+            FAX_FAMILY_LOCAL_DARK, best->gamma, best->serpentine,
+            best->sigma_px, best->strength, 1.0 - best->floor_value, 0.0);
+        if (status != FAX_ENGINE_OK) return status;
+    } else if (best->family == FAX_FAMILY_GAMMA) {
+        for (i = 0; i < 5; ++i) for (serp = 0; serp < 2; ++serp) {
+            gamma = fax_max_double(0.8, best->gamma + gamma_delta[i]);
+            status = fax_add_simple(workspace, count, next_id,
+                FAX_FAMILY_GAMMA, gamma, serp, 0.0, 0.0, 0.0, 0.0);
+            if (status != FAX_ENGINE_OK) return status;
+        }
+    } else {
+        for (i = 0; i < 5; ++i) {
+            clip = best->clip * clahe_factors[i];
+            for (j = 0; j < 3; ++j) {
+                gamma = fax_max_double(0.8, best->gamma + clahe_gamma_delta[j]);
+                for (serp = 0; serp < 2; ++serp) {
+                    status = fax_add_simple(workspace, count, next_id,
+                        FAX_FAMILY_CLAHE, gamma, serp, 0.0, 0.0, 0.0, clip);
+                    if (status != FAX_ENGINE_OK) return status;
+                }
+            }
+        }
+    }
+    return FAX_ENGINE_OK;
+}
+
+typedef struct fax_eval_shared {
+    fax_src_ptr gray;
+    fax_index width;
+    fax_index height;
+    fax_index stride;
+    double recon_sigma;
+    fax_engine_workspace *main_workspace;
+    fax_index count;
+    fax_index next;
+    fax_candidate_result *best_result;
+    int *have_best;
+    fax_dst_ptr best_binary;
+    fax_index best_binary_stride;
+    fax_candidate_callback callback;
+    void *callback_context;
+    const fax_score_context *context;
+    fax_index *evaluated;
+    fax_progress_callback progress;
+    void *progress_context;
+    fax_index estimated_total;
+    fax_engine_status status;
+    fax_mutex lock;
+} fax_eval_shared;
+
+typedef struct fax_eval_worker {
+    fax_eval_shared *shared;
+    fax_engine_workspace workspace;
+} fax_eval_worker;
+
+/* Pulls candidates until none are left; used by every thread, also serially. */
+static void fax_eval_run(void *argument)
+{
+    fax_eval_worker *worker;
+    fax_eval_shared *shared;
+    fax_index i;
+    fax_index y;
+    fax_index x;
+    fax_candidate_result result;
+    fax_engine_status status;
+    worker = (fax_eval_worker *)argument;
+    shared = worker->shared;
+    for (;;) {
+        fax_mutex_lock(&shared->lock);
+        if (shared->status != FAX_ENGINE_OK) {
+            fax_mutex_unlock(&shared->lock);
+            return;
+        }
+        i = shared->next;
+        while (i < shared->count &&
+               shared->main_workspace->candidate_entries[i].evaluated != 0) ++i;
+        if (i >= shared->count) {
+            shared->next = i;
+            fax_mutex_unlock(&shared->lock);
+            return;
+        }
+        shared->next = i + 1UL;
+        shared->main_workspace->candidate_entries[i].evaluated = 1;
+        result.candidate_id = shared->main_workspace->candidate_entries[i].candidate_id;
+        result.params = shared->main_workspace->candidate_entries[i].params;
+        fax_mutex_unlock(&shared->lock);
+        status = fax_render_internal(shared->gray, shared->width, shared->height,
+            shared->stride, &result.params, &worker->workspace,
+            worker->workspace.binary_image, shared->width);
+        if (status == FAX_ENGINE_OK) {
+            status = fax_score_internal(shared->gray, shared->width, shared->height,
+                shared->stride, worker->workspace.binary_image, shared->width,
+                shared->recon_sigma, &worker->workspace, shared->context,
+                &result.metrics);
+        }
+        fax_mutex_lock(&shared->lock);
+        if (status != FAX_ENGINE_OK) {
+            if (shared->status == FAX_ENGINE_OK) shared->status = status;
+            fax_mutex_unlock(&shared->lock);
+            return;
+        }
+        ++(*shared->evaluated);
+        if (*shared->have_best == 0 ||
+            result.metrics.score > shared->best_result->metrics.score ||
+            (result.metrics.score == shared->best_result->metrics.score &&
+             result.candidate_id < shared->best_result->candidate_id)) {
+            *shared->best_result = result;
+            *shared->have_best = 1;
+            for (y = 0UL; y < shared->height; ++y) {
+                for (x = 0UL; x < shared->width; ++x) {
+                    shared->best_binary[y * shared->best_binary_stride + x] =
+                        worker->workspace.binary_image[y * shared->width + x];
+                }
+            }
+        }
+        if (shared->callback != (fax_candidate_callback)0) {
+            shared->callback(&result, shared->callback_context);
+        }
+        if (shared->progress != (fax_progress_callback)0) {
+            shared->progress(*shared->evaluated, shared->count,
+                (shared->estimated_total > shared->count) ?
+                    shared->estimated_total : shared->count,
+                shared->progress_context);
+        }
+        fax_mutex_unlock(&shared->lock);
+    }
+}
+
+static fax_engine_status fax_evaluate_new(
+    fax_src_ptr gray, fax_index width, fax_index height, fax_index stride,
+    double recon_sigma, fax_engine_workspace *workspace,
+    fax_index start, fax_index count,
+    fax_candidate_result *best_result, int *have_best,
+    fax_dst_ptr best_binary, fax_index best_binary_stride,
+    fax_candidate_callback callback, void *callback_context,
+    const fax_score_context *context, fax_index *evaluated,
+    const fax_optimizer_options *options, fax_index estimated_total)
+{
+    fax_eval_shared shared;
+    fax_eval_worker workers[FAX_MAX_THREADS];
+    fax_thread threads[FAX_MAX_THREADS];
+    unsigned int wanted;
+    unsigned int k;
+    unsigned int started;
+    fax_engine_status status;
+    shared.gray = gray; shared.width = width; shared.height = height;
+    shared.stride = stride; shared.recon_sigma = recon_sigma;
+    shared.main_workspace = workspace; shared.count = count; shared.next = start;
+    shared.best_result = best_result; shared.have_best = have_best;
+    shared.best_binary = best_binary; shared.best_binary_stride = best_binary_stride;
+    shared.callback = callback; shared.callback_context = callback_context;
+    shared.context = context; shared.evaluated = evaluated;
+    shared.progress = options->progress;
+    shared.progress_context = options->progress_context;
+    shared.estimated_total = estimated_total;
+    shared.status = FAX_ENGINE_OK;
+    wanted = 1U;
+    if (FAX_THREADS_AVAILABLE && options->extra_workspaces != (fax_engine_workspace *)0) {
+        wanted = options->extra_count + 1U;
+        if (wanted > (unsigned int)FAX_MAX_THREADS) wanted = (unsigned int)FAX_MAX_THREADS;
+        if ((fax_index)wanted > count - start) {
+            wanted = (count > start) ? (unsigned int)(count - start) : 1U;
+        }
+    }
+    for (k = 0U; k < wanted; ++k) {
+        workers[k].shared = &shared;
+        workers[k].workspace = (k == 0U) ? *workspace : options->extra_workspaces[k - 1U];
+        workers[k].workspace.detail_ref = workspace->detail_ref;  /* read-only, shared */
+        status = fax_engine_validate_workspace(width, height, &workers[k].workspace);
+        if (status != FAX_ENGINE_OK) return status;
+    }
+    fax_mutex_init(&shared.lock);
+    started = 0U;
+    for (k = 1U; k < wanted; ++k) {
+        if (fax_thread_start(&threads[started], fax_eval_run, &workers[k]) != 0) break;
+        ++started;
+    }
+    fax_eval_run(&workers[0]);   /* the calling thread works too */
+    for (k = 0U; k < started; ++k) fax_thread_join(&threads[k]);
+    fax_mutex_destroy(&shared.lock);
+    return shared.status;
+}
+
+fax_engine_status FAX_CALL fax_optimize(
+    fax_src_ptr gray, fax_index width, fax_index height, fax_index stride,
+    const fax_optimizer_options *options,
+    fax_engine_workspace *workspace,
+    fax_candidate_result *best_result,
+    fax_dst_ptr best_binary, fax_index best_binary_stride,
+    fax_candidate_callback callback, void *callback_context,
+    fax_search_info *search_info)
+{
+    fax_score_context context;
+    fax_index count;
+    fax_index next_id;
+    fax_index evaluated;
+    fax_index start;
+    fax_index old_best_id;
+    fax_index refine_guess;
+    unsigned int round;
+    int have_best;
+    fax_engine_status status;
+    refine_guess = 35UL; /* upper bound of one refinement round (local-dark) */
+    if (gray == (fax_src_ptr)0 || options == (const fax_optimizer_options *)0 ||
+        best_result == (fax_candidate_result *)0 || best_binary == (fax_dst_ptr)0 ||
+        search_info == (fax_search_info *)0 || stride < width ||
+        best_binary_stride < width || options->sigma_px <= 0.0 ||
+        options->recon_sigma < 0.0 ||
+        (options->grid_mode != FAX_GRID_ADAPTIVE && options->grid_mode != FAX_GRID_FULL)) {
+        return FAX_ENGINE_INVALID_ARGUMENT;
+    }
+    status = fax_engine_validate_workspace(width, height, workspace);
+    if (status != FAX_ENGINE_OK) return status;
+    if (workspace->candidate_entries == (fax_search_entry FAX_WORK_QUAL *)0 ||
+        workspace->candidate_capacity < FAX_CANDIDATE_CAPACITY) {
+        return FAX_ENGINE_INSUFFICIENT_WORKSPACE;
+    }
+    status = fax_prepare_score_context(gray, width, height, stride,
+        options->sigma_px, workspace, &context);
+    if (status != FAX_ENGINE_OK) return status;
+    count = 0UL;
+    next_id = 1UL;
+    evaluated = 0UL;
+    have_best = 0;
+    status = (options->grid_mode == FAX_GRID_FULL) ?
+        fax_add_full(workspace, &count, &next_id, options->sigma_px) :
+        fax_add_coarse(workspace, &count, &next_id, options->sigma_px);
+    if (status != FAX_ENGINE_OK) return status;
+    start = 0UL;
+    status = fax_evaluate_new(gray, width, height, stride,
+        options->recon_sigma, workspace, start, count,
+        best_result, &have_best, best_binary, best_binary_stride,
+        callback, callback_context, &context, &evaluated, options,
+        (options->grid_mode == FAX_GRID_ADAPTIVE) ?
+            count + (fax_index)options->refine_rounds * refine_guess : count);
+    if (status != FAX_ENGINE_OK) return status;
+    search_info->refine_rounds_used = 0U;
+    search_info->converged = (options->grid_mode == FAX_GRID_FULL) ? 1 : 0;
+    if (options->grid_mode == FAX_GRID_ADAPTIVE) {
+        for (round = 1U; round <= options->refine_rounds; ++round) {
+            old_best_id = best_result->candidate_id;
+            start = count;
+            status = fax_add_refinement(workspace, &count, &next_id,
+                                        &best_result->params);
+            if (status != FAX_ENGINE_OK) return status;
+            search_info->refine_rounds_used = round;
+            if (count == start) {
+                search_info->converged = 1;
+                break;
+            }
+            status = fax_evaluate_new(gray, width, height, stride,
+                options->recon_sigma, workspace, start, count,
+                best_result, &have_best, best_binary, best_binary_stride,
+                callback, callback_context, &context, &evaluated, options,
+                count + (fax_index)(options->refine_rounds - round) *
+                    (count - start));
+            if (status != FAX_ENGINE_OK) return status;
+            if (best_result->candidate_id == old_best_id) {
+                search_info->converged = 1;
+                break;
+            }
+        }
+    }
+    search_info->candidates_evaluated = evaluated;
+    search_info->candidates_planned = count;
+    return FAX_ENGINE_OK;
+}
+
+fax_engine_status FAX_CALL fax_apply_candidate(
+    fax_src_ptr gray, fax_index width, fax_index height, fax_index stride,
+    const fax_candidate *candidate, fax_engine_workspace *workspace,
+    fax_dst_ptr binary, fax_index binary_stride)
+{
+    return fax_render_candidate(gray, width, height, stride, candidate,
+                                workspace, binary, binary_stride);
+}
