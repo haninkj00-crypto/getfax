@@ -1,0 +1,39 @@
+# Build outputs
+build/
+out/
+Output/
+
+# Compiled files
+*.obj
+*.o
+*.exe
+*.dll
+*.lib
+*.exp
+*.ilk
+*.pdb
+*.idb
+
+# Visual Basic IDE files
+*.vbw
+*.aps
+*.scc
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local environments
+.venv/
+venv/
+
+# vcpkg installed dependencies
+vcpkg_installed/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
