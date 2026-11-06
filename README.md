@@ -1,3 +1,5 @@
+[**Windows용 설치/Install for Windows:**](https://github.com/haninkj00-crypto/getfax/releases)
+
 # Fax C Portable Engine — complete first implementation
 
 This project is a **development-time Python source generator** for a callable, embeddable C89 grayscale-to-1-bit fax engine. Python and NumPy are required only to generate the target C sources. The core engine does not start Python or require OpenCV/libtiff. The optional modern CLI image adapter uses codec APIs directly inside the same process.
